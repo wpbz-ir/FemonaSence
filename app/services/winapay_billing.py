@@ -20,6 +20,8 @@ from app.db.models import (
 )
 from app.payments.winapay import WinaPayProvider
 from app.services.payment_sessions import create_payment_session
+from app.services.coupons import redeem_coupon_for_order, release_coupon_for_order, reserve_coupon
+from app.services.pricing import plan_toman_price
 from app.services.subscription_reminders import schedule_subscription_reminders
 
 
@@ -32,10 +34,11 @@ def _order_number(prefix: str = "FMS") -> str:
     return f"{prefix}-{stamp}-{secrets.token_hex(4).upper()}"
 
 
-async def create_winapay_subscription_order(session, *, user_id, plan: Plan):
-    price = Decimal(plan.price_toman or 0)
-    if price < 100:
-        raise ValueError("قیمت تومان برای این پلن معتبر نیست؛ حداقل مبلغ ویناپی 100 تومان است.")
+async def create_winapay_subscription_order(session, *, user_id, plan: Plan, coupon_code: str | None = None):
+    base_price = Decimal(plan_toman_price(plan))
+    if base_price < 100:
+        raise ValueError("قیمت نهایی پلن برای ویناپی باید حداقل 100 تومان باشد.")
+    price = base_price
     order = Order(
         order_number=_order_number("FMS"),
         user_id=user_id,
@@ -45,10 +48,22 @@ async def create_winapay_subscription_order(session, *, user_id, plan: Plan):
         currency="TOMAN",
         status="CREATED",
         description=f"اشتراک فمونا سنس: {plan.name_fa}",
-        extra_data={"purpose": "SUBSCRIPTION", "amount_toman": str(price)},
+        extra_data={"purpose": "SUBSCRIPTION", "amount_toman": str(price), "base_amount_toman": str(base_price)},
     )
     session.add(order)
     await session.flush()
+    if coupon_code:
+        preview = await reserve_coupon(
+            session, code=coupon_code, user_id=user_id, plan_id=plan.id, order_id=order.id,
+            amount_toman=base_price, amount_stars=0,
+        )
+        price = base_price - Decimal(preview["discount_toman"] or 0)
+        if price < 100:
+            await release_coupon_for_order(session, order_id=order.id)
+            raise ValueError("مبلغ پس از تخفیف باید حداقل 100 تومان باشد.")
+        order.amount_toman = price
+        order.extra_data.update({"amount_toman": str(price), "coupon_code": preview["code"], "coupon_discount_toman": str(preview["discount_toman"])})
+
     attempt = PaymentAttempt(
         order_id=order.id,
         provider="WINAPAY",
@@ -163,6 +178,7 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
     if not result.success:
         attempt.status = "FAILED"
         attempt.error_message = result.error_message or result.error_code
+        await release_coupon_for_order(session, order_id=order.id)
         return None
 
     if result.amount is not None and Decimal(result.amount) != amount_toman:
@@ -284,4 +300,5 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
             await session.flush()
         await schedule_subscription_reminders(session, subscription)
 
+    await redeem_coupon_for_order(session, order_id=order.id)
     return payment

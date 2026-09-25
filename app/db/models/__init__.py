@@ -26,6 +26,9 @@ from app.db.models.media import (
     TranscodeJob,
 )
 from app.db.models.commerce import (
+    Coupon,
+    CouponRedemption,
+    CouponTargetUser,
     Order,
     Payment,
     PaymentAttempt,

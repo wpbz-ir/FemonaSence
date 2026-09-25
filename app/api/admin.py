@@ -36,6 +36,9 @@ from app.db.models import (
     User,
     Wallet,
     WatchHistory,
+    Coupon,
+    CouponRedemption,
+    CouponTargetUser,
     user_roles,
 )
 
@@ -51,6 +54,7 @@ from app.services.admin_ops import (
     set_job_priority,
 )
 from app.services.audit import record_admin_action
+from app.services.text_normalization import repair_mojibake
 from app.services.content_admin import (
     attach_storage_file,
     create_collection,
@@ -1097,3 +1101,188 @@ async def admin_ui():
 @router.get("/instance", dependencies=[Depends(admin_gate)])
 async def instance():
     return {"instance_id": service_instance_id()}
+
+
+# ---------- Coupons management (commerce discounts) ----------
+
+
+class CouponCreate(BaseModel):
+    code: str | None = None
+    name_fa: str = Field(min_length=1, max_length=160)
+    description: str | None = None
+    discount_type: str = Field(pattern="^(PERCENT|FIXED_TOMAN)$")
+    value: Decimal = Field(gt=0)
+    max_uses: int | None = Field(default=None, ge=1)
+    per_user_limit: int = Field(default=1, ge=1)
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    active: bool = True
+    scope_type: str = Field(pattern="^(ALL|PLAN|USERS)$")
+    scope_plan_id: uuid.UUID | None = None
+    telegram_user_ids: list[int] = Field(default_factory=list)
+
+
+def _coupon_payload(c: Coupon, usage: dict) -> dict:
+    return {
+        "id": str(c.id),
+        "code": c.code,
+        "name_fa": c.name_fa,
+        "description": c.description,
+        "discount_type": c.discount_type,
+        "value": float(c.value),
+        "scope_type": c.scope_type,
+        "scope_plan_id": str(c.scope_plan_id) if c.scope_plan_id else None,
+        "max_uses": c.max_uses,
+        "per_user_limit": c.per_user_limit,
+        "valid_from": c.valid_from.isoformat() if c.valid_from else None,
+        "valid_until": c.valid_until.isoformat() if c.valid_until else None,
+        "active": bool(c.active),
+        "usage_count": int(usage.get(c.id, 0)),
+    }
+
+
+@router.get("/coupons", dependencies=[Depends(admin_gate)])
+async def coupons_list():
+    async with session_scope() as session:
+        rows = (
+            await session.scalars(select(Coupon).order_by(Coupon.created_at.desc()).limit(500))
+        ).all()
+        usage_rows = await session.execute(
+            select(CouponRedemption.coupon_id, func.count())
+            .where(CouponRedemption.status == "REDEEMED")
+            .group_by(CouponRedemption.coupon_id)
+        )
+        usage = {cid: n for cid, n in usage_rows.all()}
+        return [_coupon_payload(c, usage) for c in rows]
+
+
+@router.post("/coupons", dependencies=[Depends(admin_gate)])
+async def coupons_create(payload: CouponCreate, request: Request):
+    value = payload.value
+    if payload.discount_type == "PERCENT" and value > Decimal("100"):
+        raise HTTPException(status_code=422, detail="درصد تخفیف نمی‌تواند بیشتر از 100 باشد.")
+    if payload.valid_from and payload.valid_until and payload.valid_until <= payload.valid_from:
+        raise HTTPException(status_code=422, detail="پایان اعتبار باید بعد از شروع اعتبار باشد.")
+
+    code = (payload.code or f"CP-{uuid.uuid4().hex[:8].upper()}").strip().upper()
+    async with session_scope() as session:
+        exists = await session.scalar(select(func.count()).select_from(Coupon).where(Coupon.code == code))
+        if exists:
+            raise HTTPException(status_code=409, detail="این کد تخفیف قبلاً ثبت شده است.")
+
+        if payload.scope_type == "PLAN":
+            if not payload.scope_plan_id:
+                raise HTTPException(status_code=422, detail="برای محدوده پلن، انتخاب پلن الزامی است.")
+            plan = await session.get(Plan, payload.scope_plan_id)
+            if plan is None:
+                raise HTTPException(status_code=404, detail="پلن انتخاب‌شده پیدا نشد.")
+
+        coupon = Coupon(
+            code=code,
+            name_fa=payload.name_fa.strip(),
+            description=(payload.description or "").strip() or None,
+            discount_type=payload.discount_type,
+            value=value,
+            max_uses=payload.max_uses,
+            per_user_limit=max(1, int(payload.per_user_limit or 1)),
+            valid_from=payload.valid_from,
+            valid_until=payload.valid_until,
+            active=payload.active,
+            scope_type=payload.scope_type,
+            scope_plan_id=payload.scope_plan_id if payload.scope_type == "PLAN" else None,
+        )
+        session.add(coupon)
+        await session.flush()
+
+        if payload.scope_type == "USERS":
+            telegram_ids = list({int(x) for x in payload.telegram_user_ids if int(x) > 0})
+            if not telegram_ids:
+                raise HTTPException(status_code=422, detail="برای محدوده کاربران منتخب، حداقل یک شناسه تلگرام لازم است.")
+            users = (await session.scalars(select(User).where(User.telegram_user_id.in_(telegram_ids)))).all()
+            found = {u.telegram_user_id for u in users}
+            missing = [tid for tid in telegram_ids if tid not in found]
+            for u in users:
+                session.add(CouponTargetUser(coupon_id=coupon.id, user_id=u.id))
+            await session.flush()
+            if missing:
+                coupon.description = (coupon.description or "") + f" | شناسه‌های یافت‌نشده: {missing[:20]}"
+                await session.flush()
+
+        await record_admin_action(
+            session,
+            action="CREATE_COUPON",
+            entity_type="coupon",
+            entity_id=coupon.id,
+            details={"code": code, "discount_type": payload.discount_type, "value": float(value), "scope_type": payload.scope_type},
+            **_request_meta(request),
+        )
+        return _coupon_payload(coupon, {})
+
+
+class CouponUpdate(BaseModel):
+    active: bool
+
+
+@router.patch("/coupons/{coupon_id}", dependencies=[Depends(admin_gate)])
+async def coupons_update(coupon_id: uuid.UUID, payload: CouponUpdate, request: Request):
+    async with session_scope() as session:
+        coupon = await session.get(Coupon, coupon_id)
+        if coupon is None:
+            raise HTTPException(status_code=404, detail="کد تخفیف پیدا نشد.")
+        old = bool(coupon.active)
+        coupon.active = payload.active
+        await record_admin_action(
+            session,
+            action="UPDATE_COUPON",
+            entity_type="coupon",
+            entity_id=coupon.id,
+            details={"old_active": old, "new_active": payload.active},
+            **_request_meta(request),
+        )
+        return {"ok": True, "id": str(coupon.id), "active": bool(coupon.active)}
+
+
+# ---------- Encoding repair (mojibake cleanup) ----------
+
+
+@router.post("/repair-encoding", dependencies=[Depends(admin_gate)])
+async def repair_encoding(request: Request):
+    """اسکن و اصلاح متن‌های فارسی خراب‌شده (mojibake) در جدول‌های محتوایی."""
+    scanned = 0
+    changed = 0
+    samples: list[dict] = []
+    targets = [
+        (Title, "title_fa", "عنوان"),
+        (Title, "synopsis", "خلاصه"),
+        (Genre, "name_fa", "ژانر"),
+        (Person, "name_fa", "فرد"),
+        (Person, "biography", "زندگی‌نامه"),
+        (Collection, "name_fa", "مجموعه"),
+        (Collection, "description", "توضیحات مجموعه"),
+        (Season, "title", "عنوان فصل"),
+        (Season, "synopsis", "خلاصه فصل"),
+        (Episode, "title", "عنوان قسمت"),
+        (Episode, "synopsis", "خلاصه قسمت"),
+    ]
+    async with session_scope() as session:
+        for model, field, label in targets:
+            rows = (await session.scalars(select(model))).all()
+            for row in rows:
+                value = getattr(row, field, None)
+                scanned += 1
+                fixed = repair_mojibake(value)
+                if fixed != value:
+                    changed += 1
+                    if len(samples) < 20:
+                        samples.append({"field": label, "id": str(row.id), "before": value, "after": fixed})
+                    setattr(row, field, fixed)
+        if changed:
+            await record_admin_action(
+                session,
+                action="REPAIR_UTF8_MOJIBAKE",
+                entity_type="content_text",
+                entity_id=None,
+                details={"scanned": scanned, "changed": changed, "samples": samples[:10]},
+                **_request_meta(request),
+            )
+    return {"apply": True, "scanned": scanned, "changed_fields": changed, "changed": changed, "samples": samples}

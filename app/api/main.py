@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.admin import router as admin_router
+from app.api import admin_extended  # noqa: F401  (routes register on the shared admin router)
 from app.api.media_access import router as media_router
 from app.api.payments import router as payments_router
 from app.api.telegram_webhook import router as telegram_webhook_router

@@ -23,6 +23,7 @@ EXPECTED_MIGRATIONS = [
     "0013_telegram_webhook.py",
     "0014_storage_controls.py",
     "0015_production_state.py",
+    "0016_commerce_discounts.py",
 ]
 
 
@@ -183,7 +184,7 @@ def main() -> int:
     print("FINAL_AUDIT_OK")
     print("Python files checked:", len(pyfiles))
     print("Local import graph: OK")
-    print("Migrations 0001..0015: OK")
+    print("Migrations 0001..0016: OK")
     print("Secrets excluded: OK")
     print("Critical runtime/payment/media files: OK")
     return 0

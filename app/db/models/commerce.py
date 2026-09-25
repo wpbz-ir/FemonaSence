@@ -27,6 +27,7 @@ class Plan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("code", name="uq_plans_code"),
         Index("ix_plans_active_sort", "active", "sort_order"),
+        CheckConstraint("discount_percent >= 0 AND discount_percent <= 100", name="ck_plans_discount_percent"),
     )
 
     code: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -40,6 +41,58 @@ class Plan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     features: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    discount_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False, default=0)
+
+
+class Coupon(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "coupons"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_coupons_code"),
+        Index("ix_coupons_active_dates", "active", "valid_from", "valid_until"),
+        Index("ix_coupons_scope_plan", "scope_plan_id", "active"),
+    )
+
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    name_fa: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    discount_type: Mapped[str] = mapped_column(String(16), nullable=False, default="PERCENT")
+    value: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    max_uses: Mapped[int | None] = mapped_column(Integer)
+    per_user_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    valid_from: Mapped[datetime | None] = mapped_column()
+    valid_until: Mapped[datetime | None] = mapped_column()
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    scope_type: Mapped[str] = mapped_column(String(16), nullable=False, default="ALL")
+    scope_plan_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("plans.id", ondelete="CASCADE"))
+
+
+class CouponTargetUser(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "coupon_target_users"
+    __table_args__ = (
+        UniqueConstraint("coupon_id", "user_id", name="uq_coupon_target_user"),
+        Index("ix_coupon_target_users_user", "user_id"),
+    )
+
+    coupon_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("coupons.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+
+class CouponRedemption(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "coupon_redemptions"
+    __table_args__ = (
+        UniqueConstraint("coupon_id", "order_id", name="uq_coupon_redemption_order"),
+        Index("ix_coupon_redemptions_coupon_status", "coupon_id", "status"),
+        Index("ix_coupon_redemptions_user_status", "user_id", "status"),
+    )
+
+    coupon_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("coupons.id", ondelete="CASCADE"), nullable=False)
+    order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="RESERVED")
+    discount_amount_toman: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    discount_amount_stars: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reserved_at: Mapped[datetime] = mapped_column(nullable=False)
+    redeemed_at: Mapped[datetime | None] = mapped_column()
 
 
 class Subscription(UUIDPrimaryKeyMixin, TimestampMixin, Base):

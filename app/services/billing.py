@@ -10,18 +10,18 @@ from sqlalchemy import select
 
 from app.db.models import Order, Payment, PaymentAttempt, Plan, Subscription
 from app.services.subscription_reminders import schedule_subscription_reminders
+from app.services.coupons import redeem_coupon_for_order, reserve_coupon
+from app.services.pricing import plan_stars_price
 
 
 def plan_stars(plan: Plan) -> int:
-    features = plan.features or {}
-    value = features.get("telegram_stars", features.get("stars", 0))
-    return max(0, int(value or 0))
+    return plan_stars_price(plan)
 
 
-async def create_star_order(session, *, user_id, plan: Plan):
+async def create_star_order(session, *, user_id, plan: Plan, coupon_code: str | None = None):
     stars = plan_stars(plan)
     if stars <= 0:
-        raise ValueError("برای این پلن قیمت Telegram Stars تنظیم نشده است.")
+        raise ValueError("برای این پلن قیمت نهایی Telegram Stars تنظیم نشده است.")
 
     import secrets
     order_number = f"FMS-{datetime.now(timezone.utc):%Y%m%d%H%M%S}-{secrets.token_hex(6).upper()}"
@@ -33,10 +33,23 @@ async def create_star_order(session, *, user_id, plan: Plan):
         currency="XTR",
         status="CREATED",
         description=f"اشتراک فمونا سنس: {plan.name_fa}",
-        extra_data={"currency": "XTR", "telegram_stars": stars},
+        extra_data={"currency": "XTR", "telegram_stars": stars, "base_telegram_stars": plan_stars_price(plan)},
     )
     session.add(order)
     await session.flush()
+
+    discount_stars = 0
+    coupon_snapshot = None
+    if coupon_code:
+        preview = await reserve_coupon(
+            session, code=coupon_code, user_id=user_id, plan_id=plan.id,
+            order_id=order.id, amount_toman=Decimal("0"), amount_stars=stars,
+        )
+        discount_stars = int(preview["discount_stars"] or 0)
+        stars = max(1, stars - discount_stars)
+        order.amount_irr = Decimal(stars)
+        order.extra_data.update({"telegram_stars": stars, "coupon_code": preview["code"], "coupon_discount_stars": discount_stars})
+        coupon_snapshot = preview["code"]
 
     attempt = PaymentAttempt(
         order_id=order.id,
@@ -51,10 +64,11 @@ async def create_star_order(session, *, user_id, plan: Plan):
 
     payload = json.dumps(
         {
-            "v": 1,
+            "v": 2,
             "order_id": str(order.id),
             "order_number": order_number,
             "plan_id": str(plan.id),
+            "coupon_code": coupon_snapshot,
         },
         separators=(",", ":"),
     )
@@ -170,4 +184,5 @@ async def settle_star_payment(session, *, order, attempt, successful_payment):
         await session.flush()
 
     await schedule_subscription_reminders(session, subscription)
+    await redeem_coupon_for_order(session, order_id=order.id)
     return payment

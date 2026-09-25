@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 
 from app.core.config import settings
+from app.core.text import clean_text
 from app.db.models import (
     Collection,
     Genre,
@@ -78,6 +79,11 @@ async def create_title(
         raise ValueError("kind باید یکی از MOVIE، SERIES یا ANIMATION باشد.")
     if settings.content_rights_required and status.upper() == "PUBLISHED" and not rights_verified:
         raise ValueError("برای انتشار Title باید rights_verified=True باشد.")
+    title_fa = clean_text(title_fa, 255)
+    title_en = clean_text(title_en, 255) or None
+    original_title = clean_text(original_title, 255) or None
+    synopsis = clean_text(synopsis) or None
+    rights_reference = clean_text(rights_reference, 500) or None
     title = Title(
         kind=normalized_kind,
         title_fa=title_fa,
@@ -106,6 +112,8 @@ async def create_title(
 
 
 async def create_genre(session, *, name_fa: str, name_en: str, slug: str | None = None):
+    name_fa = clean_text(name_fa, 100)
+    name_en = clean_text(name_en, 100)
     row = Genre(
         name_fa=name_fa,
         name_en=name_en,
@@ -118,6 +126,8 @@ async def create_genre(session, *, name_fa: str, name_en: str, slug: str | None 
 
 
 async def create_person(session, *, name_en: str, name_fa: str | None = None):
+    name_en = clean_text(name_en, 160)
+    name_fa = clean_text(name_fa, 160) or None
     row = Person(
         name_en=name_en,
         name_fa=name_fa,
@@ -136,6 +146,9 @@ async def create_collection(
     parent_id=None,
     description: str | None = None,
 ):
+    name_fa = clean_text(name_fa, 160)
+    name_en = clean_text(name_en, 160) or None
+    description = clean_text(description) or None
     row = Collection(
         name_fa=name_fa,
         name_en=name_en,
@@ -174,6 +187,7 @@ async def create_release(
         raise ValueError("برای سریال باید Release را روی قسمت ثبت کنید.")
     if settings.content_rights_required and title.status == "PUBLISHED" and not title.rights_verified:
         raise ValueError("Title منتشرشده بدون تأیید حقوق قابل استفاده نیست.")
+    label = clean_text(label, 160) or None
     release = Release(
         title_id=title_id,
         quality=quality,
@@ -288,6 +302,8 @@ async def create_season(session, *, title_id, season_number: int, title: str | N
     )
     if exists is not None:
         raise ValueError("این فصل قبلاً ثبت شده است.")
+    title = clean_text(title, 255) or None
+    synopsis = clean_text(synopsis) or None
     row = Season(series_id=series.id, season_number=season_number, title=title, synopsis=synopsis)
     session.add(row)
     await session.flush()
@@ -313,6 +329,8 @@ async def create_episode(
     )
     if exists is not None:
         raise ValueError("این قسمت قبلاً ثبت شده است.")
+    title = clean_text(title, 255) or None
+    synopsis = clean_text(synopsis) or None
     row = Episode(
         season_id=season_id,
         episode_number=episode_number,
@@ -345,9 +363,9 @@ async def list_series_tree(session, title_id):
             {
                 "id": str(season.id),
                 "season_number": season.season_number,
-                "title": season.title,
+                "title": clean_text(season.title, 255) or None,
                 "episodes": [
-                    {"id": str(e.id), "episode_number": e.episode_number, "title": e.title} for e in episodes
+                    {"id": str(e.id), "episode_number": e.episode_number, "title": clean_text(e.title, 255) or None} for e in episodes
                 ],
             }
         )

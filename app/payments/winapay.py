@@ -20,7 +20,7 @@ class WinaPayProvider:
 
     @property
     def merchant_id(self) -> str:
-        return "sandbox" if settings.winapay_sandbox else settings.winapay_merchant_id
+        return settings.winapay_merchant_id
 
     async def create_payment(
         self,

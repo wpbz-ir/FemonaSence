@@ -458,13 +458,13 @@ def check_migrations() -> None:
         if match:
             revisions.append(match.group(1))
 
-    expected = [f"{i:04d}" for i in range(1, 16)]
+    expected = [f"{i:04d}" for i in range(1, 17)]
     for prefix in expected:
         if not any(rev.startswith(prefix) for rev in revisions):
             fail(f"MIGRATION_MISSING:{prefix}")
 
-    heads = [rev for rev in revisions if rev.startswith("0015_")]
-    if heads != ["0015_production_state"]:
+    heads = [rev for rev in revisions if rev.startswith("0016_")]
+    if heads != ["0016_commerce_discounts"]:
         fail("MIGRATION_HEAD_INVALID")
 
 
@@ -522,7 +522,7 @@ def main() -> int:
     print("Catalog/content contracts: OK")
     print("Windows deployment contract: OK")
     print("Dependencies: OK")
-    print("Alembic 0001..0015 chain/head: OK")
+    print("Alembic 0001..0016 chain/head: OK")
     print("Encoding: OK")
     print("Legacy entrypoints: OK")
     return 0
