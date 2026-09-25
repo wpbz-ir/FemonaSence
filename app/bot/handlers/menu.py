@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from aiogram import F, Router
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 
 from app.bot.keyboards.main_menu import main_menu_keyboard
@@ -56,5 +57,17 @@ async def wallet_redirect(callback: CallbackQuery):
 async def admin_redirect(callback: CallbackQuery):
     from app.bot.handlers.admin import send_admin
     await send_admin(callback)
+
+
+@router.callback_query(F.data == "menu:continue")
+async def continue_redirect(callback: CallbackQuery):
+    from app.bot.handlers.account import send_continue
+    await send_continue(callback)
+
+
+@router.callback_query(F.data == "menu:ads")
+async def ads_redirect(callback: CallbackQuery, state: FSMContext = None):
+    from app.bot.handlers.ads import ads_menu
+    await ads_menu(callback, state)
 
 

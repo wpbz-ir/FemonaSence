@@ -38,6 +38,7 @@ from app.db.models.commerce import (
     Wallet,
     WalletLedgerEntry,
 )
+from app.db.models.ads import AdRequest, AdSetting
 from app.db.models.engagement import (
     AnalyticsEvent,
     AuditLog,
@@ -104,6 +105,8 @@ __all__ = [
     "ContentPipelineItem",
     "AdminActionLog",
     "ServiceHeartbeat",
+    "AdSetting",
+    "AdRequest",
 ]
 
 from app.db.models.media_delivery import Delivery

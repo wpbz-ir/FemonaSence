@@ -87,6 +87,34 @@ async def send_favorites(callback: CallbackQuery):
     )
 
 
+async def send_continue(callback: CallbackQuery):
+    """منوی «ادامه تماشا» — عناوین نیمه‌تمام با موقعیت دقیق ذخیره‌شده."""
+    await callback.answer()
+    from app.services.watch_progress import list_watch_progress, progress_label
+
+    async with session_scope() as session:
+        user = await ensure_user(session, callback.from_user)
+        items = await list_watch_progress(session, user_id=user.id, limit=20)
+
+    buttons = []
+    for item in items:
+        name = item.get("title_fa") or item.get("title_en") or item.get("original_title") or "عنوان"
+        label = progress_label(item) or "ادامه تماشا"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"⏯️ {name[:40]} — {label}"[:64],
+                callback_data=f"cv:continue:{item['title_id']}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")])
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.edit_text(
+        "<b>⏯️ ادامه تماشا</b>\n\n"
+        + ("پخش از همان‌جایی که قطع کرده بودید ادامه پیدا می‌کند:" if items else "فعلاً پخش نیمه‌تمامی ثبت نشده است. یک عنوان را پخش کنید تا اینجا دیده شود."),
+        reply_markup=markup,
+    )
+
+
 async def send_history(callback: CallbackQuery):
     await callback.answer()
     async with session_scope() as session:

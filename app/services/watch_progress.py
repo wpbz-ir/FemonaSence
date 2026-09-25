@@ -70,6 +70,29 @@ async def save_watch_progress(
     return dict(result.mappings().one())
 
 
+async def list_watch_progress(session, *, user_id, limit: int = 20) -> list[dict]:
+    """فهرست عناوین نیمه‌تمام کاربر برای دکمه «ادامه تماشا»."""
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT wp.title_id, wp.release_id, wp.position_seconds, wp.duration_seconds, wp.last_watched_at,
+                       t.title_fa, t.title_en, t.original_title, t.poster_url
+                FROM watch_progress wp
+                JOIN titles t ON t.id = wp.title_id
+                WHERE wp.user_id = :user_id
+                  AND wp.completed = false
+                  AND wp.position_seconds >= 5
+                ORDER BY wp.last_watched_at DESC
+                LIMIT :lim
+                """
+            ),
+            {"user_id": user_id, "lim": min(50, max(1, limit))},
+        )
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 def progress_label(progress: dict | None) -> str | None:
     if not progress or progress.get("completed"):
         return None

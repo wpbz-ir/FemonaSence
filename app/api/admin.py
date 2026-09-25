@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 
 from app.api.admin_auth import require_admin_token
 from app.core.config import settings
@@ -39,6 +39,7 @@ from app.db.models import (
     Coupon,
     CouponRedemption,
     CouponTargetUser,
+    NotificationTemplate,
     user_roles,
 )
 
@@ -1263,6 +1264,13 @@ async def repair_encoding(request: Request):
         (Season, "synopsis", "خلاصه فصل"),
         (Episode, "title", "عنوان قسمت"),
         (Episode, "synopsis", "خلاصه قسمت"),
+        (Release, "label", "برچسب نسخه"),
+        (Plan, "name_fa", "نام پلن"),
+        (Plan, "description", "توضیحات پلن"),
+        (Coupon, "name_fa", "نام کد تخفیف"),
+        (Coupon, "description", "توضیحات کد تخفیف"),
+        (NotificationTemplate, "title", "عنوان اعلان"),
+        (NotificationTemplate, "body", "متن اعلان"),
     ]
     async with session_scope() as session:
         for model, field, label in targets:
@@ -1276,6 +1284,21 @@ async def repair_encoding(request: Request):
                     if len(samples) < 20:
                         samples.append({"field": label, "id": str(row.id), "before": value, "after": fixed})
                     setattr(row, field, fixed)
+        # نظرهای کاربران (جدول raw بدون ORM)
+        comment_rows = (
+            await session.execute(text("SELECT id, body FROM content_comments"))
+        ).mappings().all()
+        for row in comment_rows:
+            scanned += 1
+            fixed = repair_mojibake(row.get("body"))
+            if fixed != row.get("body"):
+                changed += 1
+                if len(samples) < 20:
+                    samples.append({"field": "نظر کاربر", "id": str(row["id"]), "before": row.get("body"), "after": fixed})
+                await session.execute(
+                    text("UPDATE content_comments SET body = :body WHERE id = :id"),
+                    {"body": fixed, "id": row["id"]},
+                )
         if changed:
             await record_admin_action(
                 session,

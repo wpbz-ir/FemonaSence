@@ -149,12 +149,16 @@ async def media_access(token: str, request: Request):
       .notice{{margin-top:10px;padding:10px 12px;background:#102137;border-radius:12px;color:#c5d6e8;font-size:13px}}
     </style></head><body><div class='wrap'><div class='hero'><div class='brand'>🎬 فمونا سنس</div><div class='hint'>لینک دسترسی زمان‌دار است</div></div>
     <div class='card'><h2 style='margin:0 0 12px'>▶️ {title}</h2>
-    <video id='player' controls playsinline preload='metadata'{poster_attr} src='/media/source/{escape(token)}'></video>
+    <video id='player' controls playsinline disablepictureinpicture controlslist='nodownload noplaybackrate noremoteplayback' preload='metadata'{poster_attr} src='/media/source/{escape(token)}'></video>
     <div class='meta'><span id='progress'>در حال آماده‌سازی…</span><span>موقعیت تماشا به‌صورت خودکار ذخیره می‌شود.</span></div>
-    <div class='notice'>برای جلوگیری از قطع پخش، این صفحه را باز نگه دارید. لینک دسترسی پس از پایان زمان اعتبار دوباره قابل استفاده نیست.</div>
+    <div class='notice'>پخش اختصاصی فمونا سنس — دانلود از طریق این پخش‌کننده غیرفعال است. لینک دسترسی پس از پایان زمان اعتبار دوباره قابل استفاده نیست.</div>
     </div></div>
     <script>
     const token={json.dumps(token)}; const p=document.getElementById('player'); const box=document.getElementById('progress');
+    // غیرفعال‌سازی دانلود: منوی راست‌کلیک، کشیدن‌ورهاکردن و کلیدهای ذخیره
+    document.addEventListener('contextmenu',e=>e.preventDefault());
+    document.addEventListener('dragstart',e=>e.preventDefault());
+    document.addEventListener('keydown',e=>{{if((e.ctrlKey||e.metaKey)&&['s','u'].includes((e.key||'').toLowerCase()))e.preventDefault();}});
     let lastSave=0; let restored=false;
     async function loadProgress(){{
       try{{const r=await fetch('/media/progress/'+encodeURIComponent(token),{{cache:'no-store'}}); if(!r.ok)return; const s=await r.json();
@@ -236,6 +240,28 @@ async def save_media_progress(token: str, progress: ProgressPayload, request: Re
             position_seconds=progress.position_seconds,
             duration_seconds=progress.duration_seconds,
         )
+        # همگام‌سازی تاریخچه کلاسیک (watch_history) تا منوی «تاریخچه» و «ادامه تماشا» ربات هم به‌روز شود
+        content_title = release.get("content_title_id") or release.get("title_id")
+        if content_title:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO watch_history (id, user_id, title_id, progress_seconds, completed, last_watched_at)
+                    VALUES (gen_random_uuid(), :user_id, :title_id, :progress, :completed, CURRENT_TIMESTAMP)
+                    ON CONFLICT (user_id, title_id)
+                    DO UPDATE SET
+                        progress_seconds = EXCLUDED.progress_seconds,
+                        completed = EXCLUDED.completed,
+                        last_watched_at = CURRENT_TIMESTAMP
+                    """
+                ),
+                {
+                    "user_id": access["user_id"],
+                    "title_id": content_title,
+                    "progress": int(saved["position_seconds"] or 0),
+                    "completed": bool(saved["completed"]),
+                },
+            )
     return {"ok": True, "position_seconds": float(saved["position_seconds"]), "completed": bool(saved["completed"])}
 
 
@@ -305,8 +331,10 @@ async def watch_party_page(token: str):
     <!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
     <meta name='robots' content='noindex,nofollow,noarchive'><title>فمونا سنس | {title}</title>
     <style>body{{margin:0;background:#07101d;color:#e5edf7;font-family:system-ui,sans-serif}}.wrap{{max-width:1100px;margin:auto;padding:16px}}.card{{background:#0f1b2d;border:1px solid #24354b;border-radius:20px;padding:14px}}video{{width:100%;max-height:75vh;background:#000;border-radius:16px}}.meta{{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:12px;color:#a9b8ca;font-size:13px}}</style>
-    </head><body><div class='wrap'><div class='card'><h2>👥 {title}</h2><video id='player' controls playsinline src='/media/party/{escape(token)}'></video><div class='meta'><span id='status'>در حال اتصال…</span><span>اعضای اتاق: {int(party.get('member_count') or 1)}</span></div></div></div>
+    </head><body><div class='wrap'><div class='card'><h2>👥 {title}</h2><video id='player' controls playsinline disablepictureinpicture controlslist='nodownload noplaybackrate noremoteplayback' src='/media/party/{escape(token)}'></video><div class='meta'><span id='status'>در حال اتصال…</span><span>اعضای اتاق: {int(party.get('member_count') or 1)}</span></div></div></div>
     <script>
+    document.addEventListener('contextmenu',e=>e.preventDefault());
+    document.addEventListener('dragstart',e=>e.preventDefault());
     const token={json.dumps(token)}; const p=document.getElementById('player'); const status=document.getElementById('status'); let applying=false; let last=0;
     async function getState(){{try{{const r=await fetch('/watch/'+encodeURIComponent(token)+'/state',{{cache:'no-store'}});if(!r.ok)return;const s=await r.json();if(!applying&&Number.isFinite(s.position_seconds)&&Math.abs(p.currentTime-s.position_seconds)>2)p.currentTime=s.position_seconds;if(s.is_playing&&p.paused){{applying=true;try{{await p.play()}}catch(e){{}}finally{{applying=false}}}}if(!s.is_playing&&!p.paused)p.pause();status.textContent=s.is_playing?'▶️ در حال پخش':'⏸️ متوقف'}}catch(e){{}}}}
     async function pushState(){{const now=Date.now();if(now-last<900)return;last=now;try{{await fetch('/watch/'+encodeURIComponent(token)+'/state',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{position_seconds:p.currentTime,is_playing:!p.paused}})}})}}catch(e){{}}}}

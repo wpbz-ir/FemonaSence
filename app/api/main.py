@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.admin import router as admin_router
 from app.api import admin_extended  # noqa: F401  (routes register on the shared admin router)
+from app.api import admin_features  # noqa: F401  (ads + membership routes on the shared admin router)
 from app.api.media_access import router as media_router
 from app.api.payments import router as payments_router
 from app.api.telegram_webhook import router as telegram_webhook_router
@@ -100,7 +101,7 @@ async def root():
 _ADMIN_SECTIONS = {
     "dashboard", "users", "user360", "titles", "series", "taxonomy",
     "upload", "pipelines", "jobs", "plans", "payments", "bot-menu",
-    "audit", "settings",
+    "audit", "settings", "membership", "ads",
 }
 _ADMIN_HTML = Path(__file__).parent / "templates" / "admin.html"
 

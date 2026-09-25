@@ -6,7 +6,7 @@ import uuid
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.orm import selectinload
 
 from app.api.admin import admin_gate, router, _request_meta
@@ -36,6 +36,8 @@ from app.db.models import (
     WalletLedgerEntry,
     WatchHistory,
     Episode,
+    Coupon,
+    NotificationTemplate,
 )
 from app.runtime.db import session_scope
 from app.services.audit import record_admin_action
@@ -694,7 +696,17 @@ async def admin_audit(offset: int = 0, limit: int = 100):
 async def repair_encoding(request: Request, apply: bool = False):
     changed = 0; scanned = 0; samples = []
     async with session_scope() as session:
-        targets = [(Title, "title_fa", "عنوان"), (Title, "synopsis", "خلاصه"), (Genre, "name_fa", "ژانر"), (Person, "name_fa", "فرد"), (Person, "biography", "زندگی‌نامه"), (Collection, "name_fa", "مجموعه"), (Collection, "description", "توضیحات مجموعه"), (Season, "title", "عنوان فصل"), (Season, "synopsis", "خلاصه فصل"), (Episode, "title", "عنوان قسمت"), (Episode, "synopsis", "خلاصه قسمت")]
+        targets = [
+            (Title, "title_fa", "عنوان"), (Title, "synopsis", "خلاصه"),
+            (Genre, "name_fa", "ژانر"), (Person, "name_fa", "فرد"), (Person, "biography", "زندگی‌نامه"),
+            (Collection, "name_fa", "مجموعه"), (Collection, "description", "توضیحات مجموعه"),
+            (Season, "title", "عنوان فصل"), (Season, "synopsis", "خلاصه فصل"),
+            (Episode, "title", "عنوان قسمت"), (Episode, "synopsis", "خلاصه قسمت"),
+            (Release, "label", "برچسب نسخه"),
+            (Plan, "name_fa", "نام پلن"), (Plan, "description", "توضیحات پلن"),
+            (Coupon, "name_fa", "نام کد تخفیف"), (Coupon, "description", "توضیحات کد تخفیف"),
+            (NotificationTemplate, "title", "عنوان اعلان"), (NotificationTemplate, "body", "متن اعلان"),
+        ]
         for model, field, label in targets:
             rows = (await session.scalars(select(model))).all()
             for row in rows:
@@ -703,6 +715,14 @@ async def repair_encoding(request: Request, apply: bool = False):
                     changed += 1
                     if len(samples) < 20: samples.append({"field": label, "id": str(row.id), "before": value, "after": fixed})
                     if apply: setattr(row, field, fixed)
+        comment_rows = (await session.execute(text("SELECT id, body FROM content_comments"))).mappings().all()
+        for row in comment_rows:
+            scanned += 1; fixed = repair_mojibake(row.get("body"))
+            if fixed != row.get("body"):
+                changed += 1
+                if len(samples) < 20: samples.append({"field": "نظر کاربر", "id": str(row["id"]), "before": row.get("body"), "after": fixed})
+                if apply:
+                    await session.execute(text("UPDATE content_comments SET body = :body WHERE id = :id"), {"body": fixed, "id": row["id"]})
         if apply and changed:
             meta = _request_meta(request) if request else {}
             await record_admin_action(session, action="REPAIR_UTF8_MOJIBAKE", entity_type="content_text", entity_id=None, actor_user_id=await _admin_actor_id(session), details={"scanned": scanned, "changed": changed, "samples": samples[:10]}, **meta)
