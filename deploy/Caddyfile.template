@@ -1,0 +1,14 @@
+# Replace example.com with the public domain of your deployment.
+# Caddy terminates TLS and forwards only the application HTTP port.
+example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8000
+
+    header {
+        -Server
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy no-referrer
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+}

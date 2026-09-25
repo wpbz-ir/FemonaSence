@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: cinema-vault-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cinema_vault
+      POSTGRES_USER: cinema_vault
+      POSTGRES_PASSWORD: CHANGE_ME
+    ports:
+      - "5432:5432"
+    volumes:
+      - cinema_vault_pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:8
+    container_name: cinema-vault-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - cinema_vault_redisdata:/data
+
+volumes:
+  cinema_vault_pgdata:
+  cinema_vault_redisdata:
