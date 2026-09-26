@@ -183,7 +183,7 @@ def main() -> int:
     print("FINAL_AUDIT_OK")
     print("Python files checked:", len(pyfiles))
     print("Local import graph: OK")
-    print("Migrations 0001..0016: OK")
+    print(f"Migrations 0001..{sorted(EXPECTED_MIGRATIONS)[-1].split("_")[0]}: OK")
     print("Secrets excluded: OK")
     print("Critical runtime/payment/media files: OK")
     return 0
