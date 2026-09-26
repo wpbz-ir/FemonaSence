@@ -29,9 +29,7 @@ from app.services.catalog import (
     top_imdb_titles,
 )
 from app.services.favorites import is_favorite, toggle_favorite
-from app.services.release_matrix import delivery_target, stream_source
 from app.services.user_account import ensure_user
-from app.services.watch_progress import get_watch_progress, progress_label
 from app.utils.telegram_ui import edit_or_send
 
 
@@ -87,16 +85,11 @@ def _title_keyboard(
     *,
     fav: bool,
     reactions: dict,
-    has_resume: bool,
     trailer: str | None,
 ) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text="▶️ پخش آنلاین", callback_data=f"cv:playselect:{title_id}"),
-            InlineKeyboardButton(text="⬇️ دانلود", callback_data=f"cv:releases:{title_id}"),
-        ],
-        [
-            InlineKeyboardButton(text="👥 تماشای گروهی", callback_data=f"cv:partyselect:{title_id}"),
+            InlineKeyboardButton(text="⬇️ دانلود نسخه‌ها", callback_data=f"cv:releases:{title_id}"),
             InlineKeyboardButton(text="📤 اشتراک‌گذاری", callback_data=f"cv:share:{title_id}"),
         ],
         [
@@ -115,8 +108,6 @@ def _title_keyboard(
             InlineKeyboardButton(text="ℹ️ اطلاعات بیشتر", callback_data=f"cv:info:{title_id}"),
         ],
     ]
-    if has_resume:
-        rows.append([InlineKeyboardButton(text="⏯️ ادامه تماشا", callback_data=f"cv:continue:{title_id}")])
     if trailer:
         rows.append([InlineKeyboardButton(text="🎞️ تریلر", url=trailer)])
     rows.append(_home_row())
@@ -424,7 +415,7 @@ async def search_message(message: Message, state: FSMContext):
     )
 
 
-def _title_caption(title: Title, reactions: dict, resume: dict | None) -> str:
+def _title_caption(title: Title, reactions: dict) -> str:
     description = _safe(getattr(title, "synopsis", ""), 900) or "توضیحات این عنوان هنوز ثبت نشده است."
     meta = []
     if getattr(title, "release_year", None):
@@ -432,13 +423,11 @@ def _title_caption(title: Title, reactions: dict, resume: dict | None) -> str:
     if getattr(title, "imdb_rating", None) is not None:
         meta.append(f"⭐ {_safe(title.imdb_rating, 8)} IMDb")
     meta_line = " | ".join(meta)
-    progress = progress_label(resume)
     return (
         f"<b>🎬 {_title_name(title)}</b>\n"
         + (f"{meta_line}\n\n" if meta_line else "\n")
         + f"{description}\n\n"
         + f"❤️ {reactions['likes']}    👎 {reactions['dislikes']}\n"
-        + (f"⏯️ {escape(progress, quote=False)}\n" if progress else "")
         + "\nگزینه موردنظر را انتخاب کنید:"
     )
 
@@ -457,15 +446,13 @@ async def _render_title(callback: CallbackQuery, title_id: UUID):
             return
         fav = await is_favorite(session, user_id=user.id, title_id=title.id)
         reactions = await reaction_summary(session, user_id=user.id, title_id=title_id)
-        resume = await get_watch_progress(session, user_id=user.id, title_id=title_id)
 
     trailer = _trailer_url(title)
-    caption = _title_caption(title, reactions, resume)
+    caption = _title_caption(title, reactions)
     keyboard = _title_keyboard(
         title.id,
         fav=fav,
         reactions=reactions,
-        has_resume=progress_label(resume) is not None,
         trailer=trailer,
     )
 
@@ -518,20 +505,18 @@ async def reaction_callback(callback: CallbackQuery):
             return
         summary = await toggle_reaction(session, user_id=user.id, title_id=title_id, value=value)
         fav = await is_favorite(session, user_id=user.id, title_id=title_id)
-        resume = await get_watch_progress(session, user_id=user.id, title_id=title_id) if title else None
     if not title or not callback.message:
         return
     keyboard = _title_keyboard(
         title.id,
         fav=fav,
         reactions=summary,
-        has_resume=progress_label(resume) is not None,
         trailer=_trailer_url(title),
     )
     try:
         await callback.message.edit_reply_markup(reply_markup=keyboard)
     except Exception:
-        await _edit_or_send(callback, _title_caption(title, summary, resume), reply_markup=keyboard)
+        await _edit_or_send(callback, _title_caption(title, summary), reply_markup=keyboard)
 
 
 @router.callback_query(F.data.regexp(r"^cv:info:.+$"))
@@ -598,35 +583,6 @@ async def share_callback(callback: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="📤 ارسال لینک عنوان", url=url)]]
         ),
-    )
-
-
-@router.callback_query(F.data.regexp(r"^cv:partyselect:.+$"))
-async def party_select(callback: CallbackQuery):
-    await callback.answer()
-    try:
-        title_id = UUID(callback.data.split(":", 2)[2])
-    except (ValueError, IndexError):
-        await callback.message.answer("شناسه عنوان نامعتبر است.")
-        return
-    from app.services.release_matrix import list_release_variants, release_badges, release_label
-    async with session_scope() as session:
-        rows = await list_release_variants(session, title_id=title_id)
-    buttons = []
-    for row in rows:
-        if not (stream_source(row) or delivery_target(row)):
-            continue
-        badges = " · ".join(release_badges(row))
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"👥 {release_label(row)} · {badges}",
-                callback_data=f"cv:party:{row['id']}",
-            )
-        ])
-    buttons.append([InlineKeyboardButton(text="🔙 برگشت", callback_data=f"cv:title:{title_id}")])
-    await _edit_or_send(callback,
-        "<b>👥 انتخاب نسخه برای تماشای گروهی</b>\n\nنسخه‌ای را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
 

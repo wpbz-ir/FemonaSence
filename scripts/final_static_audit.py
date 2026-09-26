@@ -24,6 +24,7 @@ EXPECTED_MIGRATIONS = [
     "0014_storage_controls.py",
     "0015_production_state.py",
     "0016_commerce_discounts.py",
+    "0017_ads_system.py",
 ]
 
 
@@ -135,7 +136,6 @@ def key_file_problems() -> list[str]:
     required = [
         "app/api/main.py",
         "app/api/admin.py",
-        "app/api/media_access.py",
         "app/api/payments.py",
         "app/api/telegram_webhook.py",
         "app/core/config.py",
@@ -143,7 +143,6 @@ def key_file_problems() -> list[str]:
         "app/services/access.py",
         "app/services/content_pipeline.py",
         "app/services/media_jobs.py",
-        "app/services/media_proxy.py",
         "app/services/notification_jobs.py",
         "app/services/telegram_storage.py",
         "app/services/winapay_billing.py",

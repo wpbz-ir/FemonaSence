@@ -15,7 +15,6 @@ MAIN_MENU_ITEMS: tuple[tuple[str, str], ...] = (
     ("🎬 مجموعه‌ها", "menu:collections"),
     ("👤 بازیگران", "menu:actors"),
     ("🔎 جستجو", "menu:search"),
-    ("▶️ ادامه تماشا", "menu:continue"),
     ("❤️ علاقه‌مندی‌ها", "menu:favorites"),
     ("🕘 تاریخچه", "menu:history"),
     ("👤 حساب من", "menu:account"),

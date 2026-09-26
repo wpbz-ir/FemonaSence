@@ -9,7 +9,7 @@ from sqlalchemy import delete, select
 
 from app.api.admin import _request_meta, admin_gate, router
 from app.core.config import settings
-from app.db.models import MembershipChannel, Title, WatchHistory
+from app.db.models import MembershipChannel
 from app.runtime.db import session_scope
 from app.services.ads import (
     get_ad_settings,
@@ -246,34 +246,3 @@ async def membership_channel_delete(channel_id: uuid.UUID, request: Request):
         )
     return {"ok": True}
 
-
-# ================= CONTINUE WATCHING (پنل) =================
-
-@router.get("/continue-watching", dependencies=[Depends(admin_gate)])
-async def continue_watching_list(limit: int = 50):
-    """نمای مدیریتی از آخرین تاریخچه‌های تماشا (پخش آنلاین + دریافت)."""
-    async with session_scope() as session:
-        rows = (
-            (
-                await session.execute(
-                    WatchHistory.__table__.select()
-                    .order_by(WatchHistory.last_watched_at.desc())
-                    .limit(min(200, max(1, limit)))
-                )
-            )
-            .mappings()
-            .all()
-        )
-        result = []
-        for row in rows:
-            title = await session.get(Title, row["title_id"])
-            result.append(
-                {
-                    "user_id": str(row["user_id"]),
-                    "title": (title.title_fa or title.title_en or "") if title else "",
-                    "progress_seconds": int(row.get("progress_seconds") or 0),
-                    "completed": bool(row.get("completed")),
-                    "last_watched_at": row["last_watched_at"].isoformat() if row.get("last_watched_at") else None,
-                }
-            )
-        return {"items": result}

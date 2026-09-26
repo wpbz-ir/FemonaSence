@@ -10,7 +10,6 @@ from app.bot.keyboards.main_menu import main_menu_keyboard
 from app.core.brand import WELCOME_TEXT
 from app.db.models import Title
 from app.runtime.db import session_scope
-from app.services.experience import join_watch_party, public_watch_url
 from app.services.user_account import ensure_user
 
 
@@ -21,7 +20,7 @@ HELP_TEXT = (
     "<b>📖 راهنما</b>\n\n"
     "🎬 از «منوی اصلی» فیلم، سریال و انیمیشن را ببینید.\n"
     "🔎 با «جستجوی حرفه‌ای» نام عنوان را بفرستید.\n"
-    "▶️ در صفحه هر عنوان، پخش آنلاین، دانلود و تماشای گروهی در دسترس است.\n"
+    "⬇️ در صفحه هر عنوان، نسخه‌های دانلودی را مستقیم دریافت کنید.\n"
     "❤️ عناوین موردعلاقه را در «لیست من» ذخیره کنید.\n\n"
     "دستورها:\n"
     "/start — نمایش منوی اصلی\n"
@@ -48,33 +47,14 @@ async def start_handler(message: Message):
 
     async with session_scope() as session:
         user = await ensure_user(session, message.from_user)
-        party = None
         shared_title = None
-        if payload.startswith("party_"):
-            party = await join_watch_party(
-                session,
-                invite_token=payload.removeprefix("party_"),
-                user_id=user.id,
-            )
-        elif payload.startswith("title_"):
+        if payload.startswith("title_"):
             try:
                 candidate = await session.get(Title, UUID(payload.removeprefix("title_")))
                 if candidate and str(getattr(candidate, "status", "")).upper() in {"PUBLISHED", "ACTIVE", "PUBLIC"}:
                     shared_title = candidate
             except ValueError:
                 shared_title = None
-
-    if party:
-        url = public_watch_url(party["invite_token"])
-        buttons = []
-        if url:
-            buttons.append([InlineKeyboardButton(text="▶️ ورود به اتاق تماشای گروهی", url=url)])
-        buttons.append([InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")])
-        await message.answer(
-            "<b>👥 اتاق تماشای گروهی</b>\n\nشما به اتاق اضافه شدید. لینک پخش در اختیار اعضای اتاق است.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        )
-        return
 
     if shared_title:
         name = shared_title.title_fa or shared_title.title_en or shared_title.original_title or "عنوان"
@@ -98,6 +78,6 @@ async def start_handler(message: Message):
     await message.answer(
         f"{WELCOME_TEXT}\n\n"
         "فیلم، سریال و انیمیشن را با نسخه‌های مختلف پیدا کنید.\n"
-        "برای هر عنوان، دانلود، پخش آنلاین، تماشای گروهی و امکانات اجتماعی در یک صفحه در دسترس است.",
+        "نسخه دانلودی هر عنوان مستقیماً در چت تلگرام برای شما ارسال می‌شود و امکانات اجتماعی در یک صفحه در دسترس است.",
         reply_markup=main_menu_keyboard(),
     )

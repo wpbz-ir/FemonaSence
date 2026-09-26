@@ -22,7 +22,6 @@ DEFAULTS = {
     "collections": {"enabled": True, "label": "🎬 مجموعه‌ها"},
     "actors": {"enabled": True, "label": "🎭 بازیگران"},
     "search": {"enabled": True, "label": "🔎 جستجو"},
-    "continue": {"enabled": True, "label": "▶️ ادامه تماشا"},
     "ads": {"enabled": True, "label": "📣 تبلیغات"},
     "favorites": {"enabled": True, "label": "❤️ علاقه‌مندی‌ها"},
     "history": {"enabled": True, "label": "🕘 تاریخچه"},

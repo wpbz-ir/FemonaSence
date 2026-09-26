@@ -13,7 +13,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.api.admin import router as admin_router
 from app.api import admin_extended  # noqa: F401  (routes register on the shared admin router)
 from app.api import admin_features  # noqa: F401  (ads + membership routes on the shared admin router)
-from app.api.media_access import router as media_router
 from app.api.payments import router as payments_router
 from app.api.telegram_webhook import router as telegram_webhook_router
 from app.core.brand import BRAND_NAME_FA
@@ -89,7 +88,6 @@ async def request_context(request: Request, call_next):
 
 app.include_router(admin_router)
 app.include_router(payments_router)
-app.include_router(media_router)
 app.include_router(telegram_webhook_router)
 
 

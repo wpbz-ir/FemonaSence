@@ -59,12 +59,6 @@ async def admin_redirect(callback: CallbackQuery):
     await send_admin(callback)
 
 
-@router.callback_query(F.data == "menu:continue")
-async def continue_redirect(callback: CallbackQuery):
-    from app.bot.handlers.account import send_continue
-    await send_continue(callback)
-
-
 @router.callback_query(F.data == "menu:ads")
 async def ads_redirect(callback: CallbackQuery, state: FSMContext = None):
     from app.bot.handlers.ads import ads_menu
