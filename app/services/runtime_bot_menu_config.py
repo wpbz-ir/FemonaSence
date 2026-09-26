@@ -15,6 +15,8 @@ DEFAULTS = {
     "series": {"enabled": True, "label": "📺 سریال‌ها"},
     "animation": {"enabled": True, "label": "🧿 انیمیشن"},
     "popular": {"enabled": True, "label": "🔥 محبوب‌ترین‌ها"},
+    "top": {"enabled": True, "label": "🔥 پربازدیدها"},
+    "referral": {"enabled": True, "label": "🎁 دعوت دوستان"},
     "new": {"enabled": True, "label": "🆕 تازه‌ها"},
     "imdb": {"enabled": True, "label": "⭐ برترین‌های IMDb"},
     "years": {"enabled": True, "label": "📅 سال تولید"},

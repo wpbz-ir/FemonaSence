@@ -9,6 +9,12 @@ from sqlalchemy import text
 from app.runtime.db import session_scope
 from app.services.content_pipeline import sync_pipeline_run
 from app.services.delivery import expire_deliveries
+from app.services.growth import (
+    auto_backup_if_due,
+    ensure_notification_templates,
+    schedule_winback_jobs,
+    send_weekly_admin_report,
+)
 from app.services.heartbeats import heartbeat
 from app.services.media_jobs import recover_stale_jobs
 from app.services.subscription_reminders import backfill_due_reminders
@@ -99,6 +105,8 @@ async def _sync_active_pipelines(session):
 
 async def maintenance_loop(bot, *, interval_seconds: int = 15):
     cleanup_counter = 0
+    growth_counter = 0
+    growth_every = max(1, int(900 / max(1, interval_seconds)))  # هر ~۱۵ دقیقه
     while True:
         try:
             async with session_scope() as session:
@@ -121,6 +129,15 @@ async def maintenance_loop(bot, *, interval_seconds: int = 15):
                 if cleanup_counter >= max(1, int(600 / max(1, interval_seconds))):
                     await _cleanup_history(session)
                     cleanup_counter = 0
+
+                # وظایف رشد: قالب‌های اعلان، وین‌بک، گزارش هفتگی، بک‌آپ خودکار
+                growth_counter += 1
+                if growth_counter >= growth_every:
+                    growth_counter = 0
+                    await ensure_notification_templates(session)
+                    await schedule_winback_jobs(session)
+                    await send_weekly_admin_report(bot)
+                    await auto_backup_if_due(bot)
 
         except asyncio.CancelledError:
             raise

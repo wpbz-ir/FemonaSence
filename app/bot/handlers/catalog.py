@@ -108,6 +108,7 @@ def _title_keyboard(
             InlineKeyboardButton(text="ℹ️ اطلاعات بیشتر", callback_data=f"cv:info:{title_id}"),
         ],
     ]
+    rows.append([InlineKeyboardButton(text="🎲 پیشنهاد مشابه", callback_data=f"cv:suggest:{title_id}")])
     if trailer:
         rows.append([InlineKeyboardButton(text="🎞️ تریلر", url=trailer)])
     rows.append(_home_row())

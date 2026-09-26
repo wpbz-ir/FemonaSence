@@ -67,7 +67,13 @@ async def render_notification(session, *, job_id, user_id, notification_type: st
         {"code": notification_type},
     )
     body = template or DEFAULT_MESSAGES.get(notification_type, "🔔 اعلان جدید از فمونا سنس")
-    return body.replace("{name}", name)
+    body = body.replace("{name}", name)
+    if "{coupon}" in body:
+        from app.core.config import settings
+
+        coupon = (settings.winback_coupon_code or "").strip()
+        body = body.replace("{coupon}", f"\n🎟️ کد تخفیف ویژه بازگشت: <code>{coupon}</code>" if coupon else "")
+    return body
 
 
 async def mark_notification_sent(session, *, job_id, worker_id: str, telegram_message_id: int | None):

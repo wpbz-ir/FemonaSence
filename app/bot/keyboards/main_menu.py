@@ -8,6 +8,7 @@ MAIN_MENU_ITEMS: tuple[tuple[str, str], ...] = (
     ("📺 سریال", "menu:series"),
     ("🧿 انیمیشن", "menu:animation"),
     ("🔥 محبوب", "menu:popular"),
+    ("🔥 پربازدیدها", "menu:top"),
     ("🆕 تازه‌ها", "menu:new"),
     ("⭐ IMDb", "menu:imdb"),
     ("🎭 ژانرها", "menu:genres"),
@@ -20,6 +21,7 @@ MAIN_MENU_ITEMS: tuple[tuple[str, str], ...] = (
     ("👤 حساب من", "menu:account"),
     ("💎 اشتراک", "menu:subscription"),
     ("💰 کیف پول", "menu:wallet"),
+    ("🎁 دعوت دوستان", "menu:referral"),
     ("📣 تبلیغات", "menu:ads"),
 )
 

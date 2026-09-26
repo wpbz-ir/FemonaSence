@@ -47,6 +47,11 @@ async def start_handler(message: Message):
 
     async with session_scope() as session:
         user = await ensure_user(session, message.from_user)
+        ref_result = None
+        if payload.startswith("ref_"):
+            from app.services.growth import link_referral
+
+            ref_result = await link_referral(session, referred_user=user, code=payload.removeprefix("ref_"))
         shared_title = None
         if payload.startswith("title_"):
             try:
@@ -74,6 +79,16 @@ async def start_handler(message: Message):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
         return
+
+    if ref_result and ref_result.get("ok") and ref_result.get("referrer_tg_id"):
+        try:
+            await message.bot.send_message(
+                int(ref_result["referrer_tg_id"]),
+                "🎁 یکی از دوستانتان با لینک دعوت شما وارد ربات شد!\n"
+                f"💰 {int(ref_result['amount_irr']):,} ریال اعتبار به کیف پول شما اضافه شد.",
+            )
+        except Exception:
+            pass
 
     await message.answer(
         f"{WELCOME_TEXT}\n\n"

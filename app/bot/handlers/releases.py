@@ -4,13 +4,17 @@ from uuid import UUID
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select
 
+from app.core.config import settings
 from app.runtime.db import session_scope
 from app.services.access import can_access_release
+from app.services.growth import daily_download_count, record_download
 from app.services.release_matrix import delivery_target, get_release_variant, list_release_variants, release_badges, release_label
+from app.services.rbac import is_super_admin
 from app.services.user_account import ensure_user
 from app.utils.telegram_ui import edit_or_send as _edit_or_send
-from app.db.models import Title
+from app.db.models import Subscription, Title
 
 
 router = Router(name="releases")
@@ -81,6 +85,27 @@ async def download_release(callback: CallbackQuery):
         if not allowed:
             await callback.message.answer(reason)
             return
+        # 🛡 سهمیه دانلود روزانه برای کاربران بدون اشتراک (ادمین و مشترک = نامحدود)
+        limit = settings.free_daily_download_limit
+        if limit and limit > 0 and not await is_super_admin(session, user.id):
+            sub = await session.scalar(
+                select(Subscription).where(
+                    Subscription.user_id == user.id,
+                    Subscription.status == "ACTIVE",
+                )
+            )
+            if not sub:
+                used = await daily_download_count(session, user_id=user.id)
+                if used >= limit:
+                    await callback.message.answer(
+                        f"⛔ سهمیه دانلود رایگان امروز شما ({limit} مورد) به پایان رسیده است.\n"
+                        "💎 با تهیه اشتراک، دانلود نامحدود خواهید داشت.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💎 خرید اشتراک", callback_data="menu:subscription")],
+                            [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")],
+                        ]),
+                    )
+                    return
         target = delivery_target(row)
     if not target:
         await callback.message.answer("فایل این نسخه هنوز به Telegram Storage متصل نیست.")
@@ -90,4 +115,15 @@ async def download_release(callback: CallbackQuery):
     except Exception:
         await callback.message.answer("ارسال فایل انجام نشد. وضعیت Storage را بررسی کنید.")
         return
+    # ثبت آمار دانلود (پایه «پربازدیدها» و گزارش‌ها)
+    async with session_scope() as session:
+        await record_download(session, user_id=user.id, release_id=release_id)
     await callback.message.answer("نسخه انتخابی برای شما ارسال شد. ✅")
+    # ⭐ امتیازدهی کیفیت
+    await callback.message.answer(
+        "نظرتان درباره کیفیت این نسخه چیست؟",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="👍 خوب بود", callback_data=f"cv:rate:{release_id}:1"),
+            InlineKeyboardButton(text="👎 مشکل داشت", callback_data=f"cv:rate:{release_id}:0"),
+        ]]),
+    )

@@ -57,6 +57,13 @@ class Settings:
     content_rights_required: bool = os.getenv("CONTENT_RIGHTS_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}
     telegram_storage_required: bool = os.getenv("TELEGRAM_STORAGE_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}
     startup_validate: bool = os.getenv("STARTUP_VALIDATE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    # رشد و عملیات دوره‌ای
+    free_daily_download_limit: int = max(0, int(os.getenv("FREE_DAILY_DOWNLOAD_LIMIT", "5") or "0"))
+    referral_reward_irr: int = max(0, int(os.getenv("REFERRAL_REWARD_IRR", "100000") or "0"))
+    winback_coupon_code: str = os.getenv("WINBACK_COUPON_CODE", "").strip()
+    auto_backup_enabled: bool = os.getenv("AUTO_BACKUP_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    auto_backup_chat_id: int | None = _int_or_none(os.getenv("AUTO_BACKUP_CHAT_ID"))
+    auto_backup_hour: int = max(0, min(23, int(os.getenv("AUTO_BACKUP_HOUR", "3") or "3")))
 
 
 settings = Settings()
