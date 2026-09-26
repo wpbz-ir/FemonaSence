@@ -166,8 +166,9 @@ async def health_ready():
 
     if settings.bot_token:
         try:
-            from aiogram import Bot
-            bot = Bot(settings.bot_token)
+            from app.bot.session import make_bot
+
+            bot = make_bot()
             me = await bot.get_me()
             bot_ok = bool(me.id)
             await bot.session.close()

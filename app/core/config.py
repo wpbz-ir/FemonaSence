@@ -49,6 +49,7 @@ class Settings:
     media_allow_any_https: bool = os.getenv("MEDIA_ALLOW_ANY_HTTPS", "0").strip().lower() in {"1", "true", "yes", "on"}
     telegram_mode: str = os.getenv("TELEGRAM_MODE", "polling").strip().lower()
     telegram_webhook_secret: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+    telegram_proxy_url: str = os.getenv("TELEGRAM_PROXY_URL", "").strip()
     bot_username: str = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
     run_maintenance_in_bot: bool = os.getenv("RUN_MAINTENANCE_IN_BOT", "1").strip().lower() in {"1", "true", "yes", "on"}
     run_notifications_in_bot: bool = os.getenv("RUN_NOTIFICATIONS_IN_BOT", "1").strip().lower() in {"1", "true", "yes", "on"}

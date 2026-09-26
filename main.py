@@ -16,14 +16,24 @@ logger = logging.getLogger("cinemavault.main")
 
 
 async def setup_commands(bot: Bot) -> None:
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="شروع"),
-            BotCommand(command="help", description="راهنما"),
-            BotCommand(command="subscription", description="اشتراک"),
-            BotCommand(command="paysupport", description="پشتیبانی پرداخت"),
-        ]
-    )
+    commands = [
+        BotCommand(command="start", description="شروع"),
+        BotCommand(command="help", description="راهنما"),
+        BotCommand(command="subscription", description="اشتراک"),
+        BotCommand(command="paysupport", description="پشتیبانی پرداخت"),
+    ]
+    # تلگرام موقتا در دسترس نبود؟ نباید کل ربات کرش کند - چند بار تلاش و بعد ادامه
+    for attempt in range(1, 4):
+        try:
+            await bot.set_my_commands(commands)
+            return
+        except Exception:
+            logger.warning(
+                "set_my_commands failed (attempt %s/3) - is Telegram reachable?",
+                attempt,
+            )
+            await asyncio.sleep(5)
+    logger.warning("Telegram unreachable at startup - continuing without set_my_commands")
 
 
 async def register_error_handler(dp) -> None:
@@ -78,7 +88,8 @@ async def main() -> None:
         print("ربات در حال اجراست...")
         print("======================================")
 
-        tasks = [dp.start_polling(bot)]
+        # polling هم supervision شده تا قطعی شبکه کل ربات را نکشد
+        tasks = [_supervised("polling", lambda: dp.start_polling(bot))]
         if settings.run_maintenance_in_bot:
             tasks.append(
                 _supervised(

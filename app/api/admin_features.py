@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import uuid
 
-from aiogram import Bot
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 
 from app.api.admin import _request_meta, admin_gate, router
+from app.bot.session import make_bot
 from app.core.config import settings
 from app.db.models import MembershipChannel
 from app.runtime.db import session_scope
@@ -148,7 +148,7 @@ async def membership_channel_create(payload: MembershipChannelPayload, request: 
     bot = None
     if settings.bot_token:
         try:
-            bot = Bot(token=settings.bot_token)
+            bot = make_bot()
         except Exception:
             bot = None
     try:

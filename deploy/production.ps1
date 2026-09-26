@@ -71,6 +71,8 @@ foreach ($service in $services) {
 
 Start-Sleep -Seconds 10
 
+$botFailed = $false
+
 foreach ($item in $processes) {
     if ($item.Process.HasExited) {
         Write-Host ""
@@ -88,6 +90,18 @@ foreach ($item in $processes) {
             Get-Content $service.Out -ErrorAction SilentlyContinue | Select-Object -Last 120
         }
 
+        if ($item.Name -eq "BOT") {
+            # Non-fatal: when api.telegram.org is unreachable, the panel and
+            # workers must stay online. Only the bot is affected.
+            $botFailed = $true
+            Write-Host "BOT failed but panel and workers keep running." -ForegroundColor Yellow
+            Write-Host "Hints:" -ForegroundColor Yellow
+            Write-Host "  1) Test connectivity: Test-NetConnection api.telegram.org -Port 443"
+            Write-Host "  2) If Telegram is blocked, set TELEGRAM_PROXY_URL in .env (e.g. socks5://127.0.0.1:10808)"
+            Write-Host "  3) To start without the bot: set START_BOT=0 before running start_local.ps1"
+            continue
+        }
+
         foreach ($other in $processes) {
             if (-not $other.Process.HasExited) {
                 Stop-Process -Id $other.Process.Id -Force -ErrorAction SilentlyContinue
@@ -99,7 +113,15 @@ foreach ($item in $processes) {
 }
 
 Write-Host ""
-Write-Host "WINDOWS_PROCESS_STARTUP_OK"
+if ($botFailed) {
+    Write-Host "WINDOWS_PROCESS_STARTUP_OK (BOT failed - panel is online, see hints above)" -ForegroundColor Yellow
+} else {
+    Write-Host "WINDOWS_PROCESS_STARTUP_OK"
+}
 $processes | ForEach-Object {
-    Write-Host "$($_.Name)_PID=$($_.Process.Id)"
+    if ($_.Process.HasExited) {
+        Write-Host "$($_.Name)_PID=FAILED"
+    } else {
+        Write-Host "$($_.Name)_PID=$($_.Process.Id)"
+    }
 }

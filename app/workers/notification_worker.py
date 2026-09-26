@@ -4,10 +4,7 @@ import asyncio
 import logging
 import os
 
-from aiogram import Bot
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-
+from app.bot.session import make_bot
 from app.core.config import settings
 from app.runtime.db import session_scope
 from app.services.notification_jobs import (
@@ -23,7 +20,7 @@ logger = logging.getLogger("femona.notification_worker")
 async def run_notification_worker(*, poll_seconds: float = 1.0):
     if not settings.bot_token:
         raise RuntimeError("BOT_TOKEN is not configured.")
-    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = make_bot()
     worker_id = os.getenv("NOTIFICATION_WORKER_ID", "notification-worker-1").strip() or "notification-worker-1"
     try:
         while True:

@@ -1,22 +1,14 @@
 from __future__ import annotations
 
 from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 
 from app.bot.handlers import ads, catalog, growth, menu, payments, releases, start, storage
 from app.bot.handlers import membership  # باید اول از همه ثبت شود (دروازه عضویت)
-from app.core.config import settings
+from app.bot.session import make_bot
 
 
 def create_bot() -> tuple[Bot, Dispatcher]:
-    if not settings.bot_token:
-        raise RuntimeError("BOT_TOKEN در .env تنظیم نشده است.")
-
-    bot = Bot(
-        token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = make_bot()
 
     dp = Dispatcher()
     # ترتیب مهم است: دروازه عضویت قبل از همه روترهای محتوایی

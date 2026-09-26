@@ -14,8 +14,11 @@ async def check_telegram_storage() -> dict:
         return {"ok": False, "error": "TELEGRAM_STORAGE_CHAT_ID is not configured"}
 
     import aiohttp
+
+    from app.bot.session import telegram_aiohttp_connector
+
     timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, connector=telegram_aiohttp_connector()) as session:
         me = await client._json(session, "getMe")
         chat = await client._json(session, "getChat", params={"chat_id": chat_id})
         try:

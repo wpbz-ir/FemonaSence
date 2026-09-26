@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import shutil
 from pathlib import Path
-from typing import BinaryIO
 
 import aiohttp
 from sqlalchemy import text
+
+from app.bot.session import telegram_aiohttp_connector
 
 
 class TelegramMediaError(RuntimeError):
@@ -54,7 +54,7 @@ class TelegramMediaClient:
             return payload["result"]
 
     async def get_file(self, file_id: str) -> dict:
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+        async with aiohttp.ClientSession(timeout=self.timeout, connector=telegram_aiohttp_connector()) as session:
             return await self._json(session, "getFile", params={"file_id": file_id})
 
     async def download_file(self, *, file_id: str, destination: Path) -> dict:
@@ -73,7 +73,7 @@ class TelegramMediaClient:
 
         url = self._file_url(file_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+        async with aiohttp.ClientSession(timeout=self.timeout, connector=telegram_aiohttp_connector()) as session:
             async with session.get(url) as response:
                 if response.status >= 400:
                     raise TelegramMediaError("TELEGRAM_FILE_DOWNLOAD_FAILED", f"HTTP {response.status}")
@@ -97,7 +97,7 @@ class TelegramMediaClient:
                 filename=path.name,
                 content_type="video/mp4",
             )
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=60, sock_read=600), connector=telegram_aiohttp_connector()) as session:
                 return await self._json(session, "sendVideo", data=form)
 
 
