@@ -44,9 +44,9 @@ if ($env:TELEGRAM_MODE -eq "polling" -and $env:START_BOT -ne "0") {
     }
 }
 elseif ($env:TELEGRAM_MODE -eq "polling" -and $env:START_BOT -eq "0") {
-    # اجرای بدون ربات (مثلاً وقتی دسترسی به api.telegram.org برقرار نیست):
-    #   $env:START_BOT = "0"  سپس start_local.ps1 را اجرا کنید — پنل و ورکرها بالا می‌آیند.
-    Write-Host "BOT skipped (START_BOT=0) — panel and workers are starting without the Telegram bot." -ForegroundColor Yellow
+    # Run without the bot (e.g. when api.telegram.org is unreachable):
+    #   $env:START_BOT = "0"  then run start_local.ps1 -- panel and workers start, bot is skipped.
+    Write-Host "BOT skipped (START_BOT=0) - panel and workers are starting without the Telegram bot." -ForegroundColor Yellow
 }
 
 foreach ($service in $services) {
