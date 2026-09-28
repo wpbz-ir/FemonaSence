@@ -177,6 +177,8 @@ class MatrixRequest(BaseModel):
     requires_subscription: bool = False
     minimum_plan_rank: int = Field(default=0, ge=0, le=1000)
     priority: int = Field(default=50, ge=-1000, le=1000)
+    # [FA-ONLY] ارتفاع دستی منبع برای فایل‌های «فایلی» که ابعاد تلگرامی ندارند
+    source_height: int | None = Field(default=None, ge=144, le=8640)
     description: str | None = Field(default=None, max_length=2000)
     target_language: str = Field(default="ORIGINAL", max_length=32)
     target_subtitle_type: str = Field(default="NONE", max_length=32)
@@ -798,7 +800,7 @@ async def pipeline_advanced(title_id: uuid.UUID, payload: MatrixRequest, request
         if source.title_id != title.id:
             raise HTTPException(status_code=422, detail="نسخه‌ی مبنا به این عنوان تعلق ندارد.")
         try:
-            run = await build_quality_matrix(session, source_release_id=source.id, requested_qualities=payload.qualities, requires_subscription=payload.requires_subscription, minimum_plan_rank=payload.minimum_plan_rank, priority=payload.priority, description=payload.description, target_language=payload.target_language, target_subtitle_type=payload.target_subtitle_type, target_codec_video=payload.target_codec_video, target_codec_audio=payload.target_codec_audio, target_container=payload.target_container, auto_publish=payload.auto_publish)
+            run = await build_quality_matrix(session, source_release_id=source.id, requested_qualities=payload.qualities, requires_subscription=payload.requires_subscription, minimum_plan_rank=payload.minimum_plan_rank, priority=payload.priority, source_height=payload.source_height, description=payload.description, target_language=payload.target_language, target_subtitle_type=payload.target_subtitle_type, target_codec_video=payload.target_codec_video, target_codec_audio=payload.target_codec_audio, target_container=payload.target_container, auto_publish=payload.auto_publish)
         except PipelineError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ValueError as exc:

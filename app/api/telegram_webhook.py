@@ -38,16 +38,16 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str | None 
     try:
         await enforce(f"wh:{client_host}", limit=60, window_seconds=60)
     except RateLimitExceeded as exc:
-        raise HTTPException(status_code=429, detail="Too many requests") from exc
+        raise HTTPException(status_code=429, detail="تعداد درخواست‌ها بیش از حد مجاز است.") from exc
     except RateLimitUnavailable:
         pass
 
     if settings.telegram_mode != "webhook":
-        raise HTTPException(status_code=404, detail="Webhook mode is disabled.")
+        raise HTTPException(status_code=404, detail="حالت وب‌هوک غیرفعال است.")
     if len(settings.telegram_webhook_secret) < 16:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail="پیدا نشد.")
     if not _constant_time_equal(x_telegram_bot_api_secret_token or "", settings.telegram_webhook_secret):
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+        raise HTTPException(status_code=401, detail="رمز وب‌هوک نامعتبر است.")
 
     # [5-INT-b / 5-G12-c #6] سقف اندازه‌ی بدنه — قبل از request.body() تا یک بدنه‌ی
     # غیرمتعارف بزرگ در حافظه بارگذاری نشود (Content-Length غایب = نادیده؛ تلگرام همیشه می‌فرستد).
@@ -56,16 +56,16 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str | None 
     # (۵۰۰). هدر غایب/خالی مثل قبل نادیده گرفته می‌شود؛ مقدار غیرعددی ASCII → 400؛
     # مقدار عددی بالاتر از سقف → 413 (مطابق رفتار قبلی سقف بدنه).
     if content_length and not (content_length.isascii() and content_length.isdecimal()):
-        raise HTTPException(status_code=400, detail="Invalid Content-Length")
+        raise HTTPException(status_code=400, detail="طول محتوا (Content-Length) نامعتبر است.")
     if content_length.isascii() and content_length.isdecimal() and int(content_length) > MAX_WEBHOOK_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="Payload too large")
+        raise HTTPException(status_code=413, detail="حجم بار ارسالی بیش از حد مجاز است.")
 
     raw = await request.body()
     try:
         payload = json.loads(raw.decode("utf-8"))
         update = Update.model_validate(payload)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid Telegram update.") from exc
+        raise HTTPException(status_code=400, detail="به‌روزرسانی تلگرام نامعتبر است.") from exc
 
     bot, dp = create_bot()
     update_id = int(update.update_id)
@@ -153,7 +153,7 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str | None 
                     {"id": ledger_id, "error": str(exc)[:4000]},
                 )
                 await session.commit()
-            raise HTTPException(status_code=500, detail="Update processing failed.") from exc
+            raise HTTPException(status_code=500, detail="پردازش رخداد شکست خورد.") from exc
 
         async with session_scope() as session:
             await session.execute(

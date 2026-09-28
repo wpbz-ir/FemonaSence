@@ -145,6 +145,9 @@ class PipelineRequest(BaseModel):
     requires_subscription: bool = False
     minimum_plan_rank: int = Field(default=0, ge=0, le=1000)
     priority: int = Field(default=50, ge=-1000, le=1000)
+    # [FA-ONLY] برای فایل‌هایی که به‌صورت «فایل» در کانال ارسال شده‌اند تلگرام ابعاد
+    # ندارد؛ ادمین می‌تواند ارتفاع منبع را دستی اعلام کند (مثلاً 1080).
+    source_height: int | None = Field(default=None, ge=144, le=8640)
 
 
 class PlanCreate(BaseModel):
@@ -189,7 +192,7 @@ async def admin_gate(request: Request):
     except RateLimitExceeded as exc:
         raise HTTPException(status_code=429, detail="تعداد درخواست‌های پنل بیش از حد مجاز است.") from exc
     except RateLimitUnavailable as exc:
-        raise HTTPException(status_code=503, detail="Rate limiter backend is unavailable.") from exc
+        raise HTTPException(status_code=503, detail="سرویس محدودساز نرخ در دسترس نیست.") from exc
     require_admin_token(request)
 
 
@@ -280,7 +283,7 @@ async def update_title_api(title_id: uuid.UUID, payload: TitleUpdate, request: R
     async with session_scope() as session:
         title = await session.get(Title, title_id)
         if title is None:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(status_code=404, detail="عنوان پیدا نشد.")
         values = payload.model_dump(exclude_unset=True)
         if values.get("status") == "PUBLISHED" and settings.content_rights_required:
             if not values.get("rights_verified", title.rights_verified):
@@ -308,7 +311,7 @@ async def title_api(title_id: uuid.UUID):
     async with session_scope() as session:
         title = await get_title(session, title_id)
         if title is None:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(status_code=404, detail="عنوان پیدا نشد.")
 
         releases = await session.scalars(
             select(Release)
@@ -354,7 +357,7 @@ async def release_api(title_id: uuid.UUID, payload: ReleaseCreate, request: Requ
     async with session_scope() as session:
         title = await session.get(Title, title_id)
         if title is None:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(status_code=404, detail="عنوان پیدا نشد.")
         row = await create_release(session, title_id=title_id, **payload.model_dump())
         await record_admin_action(
             session,
@@ -371,7 +374,7 @@ async def release_update(release_id: uuid.UUID, payload: ReleaseUpdate, request:
     async with session_scope() as session:
         release = await session.get(Release, release_id)
         if release is None:
-            raise HTTPException(status_code=404, detail="Release not found")
+            raise HTTPException(status_code=404, detail="نسخه پیدا نشد.")
         values = payload.model_dump(exclude_unset=True)
         if values.get("status") == "PUBLISHED":
             parent_title_id = release.title_id
@@ -411,14 +414,14 @@ async def pipeline_api(title_id: uuid.UUID, payload: PipelineRequest, request: R
     async with session_scope() as session:
         title = await session.get(Title, title_id)
         if title is None:
-            raise HTTPException(status_code=404, detail="Title not found")
+            raise HTTPException(status_code=404, detail="عنوان پیدا نشد.")
         source = await session.get(Release, payload.source_release_id)
         if source is None:
-            raise HTTPException(status_code=404, detail="Source release not found")
+            raise HTTPException(status_code=404, detail="نسخه مبنا پیدا نشد.")
         if source.title_id != title_id:
             # For episode releases the source belongs to the requested title through the series tree.
             if source.episode_id is None:
-                raise HTTPException(status_code=409, detail="Source release is not owned by this title.")
+                raise HTTPException(status_code=409, detail="نسخه مبنا به این عنوان تعلق ندارد.")
         try:
             run = await build_quality_matrix(
                 session,
@@ -427,11 +430,12 @@ async def pipeline_api(title_id: uuid.UUID, payload: PipelineRequest, request: R
                 requires_subscription=payload.requires_subscription,
                 minimum_plan_rank=payload.minimum_plan_rank,
                 priority=payload.priority,
+                source_height=payload.source_height,
             )
         except PipelineError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if run.title_id != title_id:
-            raise HTTPException(status_code=409, detail="Source release is not owned by the requested title.")
+            raise HTTPException(status_code=409, detail="نسخه مبنا به عنوان درخواستی تعلق ندارد.")
 
         await record_admin_action(
             session,
@@ -524,7 +528,7 @@ async def job_detail(job_id: uuid.UUID):
     async with session_scope() as session:
         result = await get_job(session, job_id)
         if result is None:
-            raise HTTPException(status_code=404, detail="Job not found")
+            raise HTTPException(status_code=404, detail="وظیفه پیدا نشد.")
         job, events = result
         return {
             "job": {
@@ -691,7 +695,7 @@ async def plan_update(plan_id: uuid.UUID, payload: PlanUpdate, request: Request)
     async with session_scope() as session:
         row = await session.get(Plan, plan_id)
         if row is None:
-            raise HTTPException(status_code=404, detail="Plan not found")
+            raise HTTPException(status_code=404, detail="پلن پیدا نشد.")
         values = payload.model_dump(exclude_unset=True)
         old = {k: getattr(row, k) for k in values}
         for k, v in values.items():

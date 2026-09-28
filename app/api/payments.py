@@ -24,7 +24,7 @@ router = APIRouter(prefix="/payments", tags=["payments"])
 @router.get("/winapay/start/{token}")
 async def start_winapay_payment(token: str):
     if not settings.public_base_url.startswith("https://") and settings.app_env == "production":
-        raise HTTPException(status_code=503, detail="PUBLIC_BASE_URL is not configured for secure payment callbacks.")
+        raise HTTPException(status_code=503, detail="آدرس عمومی پایه (PUBLIC_BASE_URL) تنظیم نشده است؛ بازگشت امن پرداخت کار نمی‌کند.")
     try:
         await enforce(f"payment-start:{token[:24]}", limit=20, window_seconds=60)
     except RateLimitExceeded as exc:

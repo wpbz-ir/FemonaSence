@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -87,7 +88,7 @@ async def _resolve_parent(session, source_release: Release) -> tuple[object, obj
         return source_release.title_id, source_release.episode_id, "TITLE"
 
     if source_release.episode_id is None:
-        raise PipelineError("Source release parent is invalid.")
+        raise PipelineError("والدِ نسخهٔ منبع نامعتبر است.")
 
     row = (
         await session.execute(
@@ -98,7 +99,7 @@ async def _resolve_parent(session, source_release: Release) -> tuple[object, obj
         )
     ).first()
     if row is None:
-        raise PipelineError("Episode parent could not be resolved.")
+        raise PipelineError("قسمتِ والد قابل شناسایی نیست.")
     return row.title_id, source_release.episode_id, "EPISODE"
 
 
@@ -119,15 +120,48 @@ async def _source_storage(session, release_id):
     return row[1] if row else None
 
 
-def _source_height(release: Release, storage: StorageFile) -> int:
+def _source_height(release: Release, storage: StorageFile, override: int | None = None) -> int:
+    """ارتفاع مؤثرِ منبع — نزدیک‌ترین داده‌ی در دسترس، در ترتیب اتکا:
+
+    ۱) height ثبت‌شده روی خود نسخه (از متادیتای پست ویدیویی تلگرام)
+    ۲) متادیتای فایل ذخیره‌سازی (height / video_height)
+    ۳) مقدار دستیِ ادمین (فیلد «ارتفاع منبع» در فرم پردازش کیفیت)
+    ۴) استخراج از رشته‌ی کیفیتِ ثبت‌شده روی نسخه («1080p» → 1080، «4K» → 2160)
+
+    فایل‌هایی که به‌صورت «فایل/دوکیومنت» در کانال ارسال می‌شوند از تلگرام ابعاد
+    نمی‌گیرند؛ برای همین مسیرهای ۳ و ۴ وجود دارند تا ثبتِ ماتریس کیفیت هرگز به
+    دلیل نبودِ ابعاد متوقف نشود.
+    """
+    candidates: list[int] = []
     if release.height:
-        return int(release.height)
+        candidates.append(int(release.height))
     metadata = storage.extra_data or {}
     value = metadata.get("height") or metadata.get("video_height")
     try:
-        return int(value)
+        candidates.append(int(value))
     except (TypeError, ValueError):
-        return 0
+        pass
+    if override:
+        try:
+            candidates.append(int(override))
+        except (TypeError, ValueError):
+            pass
+    for candidate in candidates:
+        if candidate > 0:
+            return candidate
+    # آخرین پشتوانه: کیفیتِ ثبت‌شده‌ی خود نسخه (ارقام فارسی هم نرمال می‌شود)
+    quality = str(
+        release.quality or ""
+    ).translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")).strip().lower()
+    mapped = {"4k": 2160, "2k": 1440, "8k": 4320}.get(quality)
+    if mapped:
+        return mapped
+    match = re.search(r"(\d{3,4})\s*p?", quality)
+    if match:
+        height = int(match.group(1))
+        if 100 < height <= 8640:
+            return height
+    return 0
 
 
 async def build_quality_matrix(
@@ -139,6 +173,7 @@ async def build_quality_matrix(
     requires_subscription: bool = False,
     minimum_plan_rank: int = 0,
     priority: int = 50,
+    source_height: int | None = None,
     description: str | None = None,
     target_language: str = "ORIGINAL",
     target_subtitle_type: str = "NONE",
@@ -149,18 +184,21 @@ async def build_quality_matrix(
 ):
     source = await session.get(Release, source_release_id)
     if source is None:
-        raise PipelineError("Source release not found.")
+        raise PipelineError("نسخهٔ منبع پیدا نشد.")
     if source.status in {"ARCHIVED", "DISABLED"}:
-        raise PipelineError("Source release is disabled or archived.")
+        raise PipelineError("نسخهٔ منبع غیرفعال یا بایگانی شده است.")
 
     title_id, episode_id, parent_type = await _resolve_parent(session, source)
     storage = await _source_storage(session, source.id)
     if storage is None:
-        raise PipelineError("Source release has no READY StorageFile.")
+        raise PipelineError("فایل ذخیره‌سازی آماده‌ای به این نسخه متصل نیست.")
 
-    source_height = _source_height(source, storage)
+    source_height = _source_height(source, storage, override=source_height)
     if source_height <= 0:
-        raise PipelineError("Source dimensions are required before building the quality matrix.")
+        raise PipelineError(
+            "ابعاد منبع مشخص نیست؛ در فرم «پردازش کیفیت» فیلد «ارتفاع منبع (p)» را پر کنید. "
+            "(فایل‌هایی که به‌صورت «فایل» در کانال ارسال می‌شوند ابعاد ندارند)"
+        )
     if settings.content_rights_required:
         title = await session.get(Title, title_id)
         if title is None or not title.rights_verified:
@@ -170,7 +208,7 @@ async def build_quality_matrix(
     qualities = sorted({normalize_quality(value) for value in raw}, key=lambda x: int(x))
     qualities = [q for q in qualities if int(q) <= source_height]
     if not qualities:
-        raise PipelineError(f"No requested quality is supported by the {source_height}p source.")
+        raise PipelineError(f"هیچ‌یک از کیفیت‌های درخواستی برای منبعِ {source_height}p قابل ساخت نیست.")
 
     advanced = _advanced_settings(
         description=description,
@@ -231,7 +269,7 @@ async def build_quality_matrix(
             .options(selectinload(ContentPipelineRun.items))
         )
         if run is None:  # defensive: our own committed-in-txn write must exist
-            raise PipelineError("Pipeline run could not be created or fetched.")
+            raise PipelineError("اجرای خط تولید ساخته یا خوانده نشد.")
 
     if not inserted_here and run.status in {"QUEUED", "RUNNING", "SUCCEEDED"}:
         return run
@@ -413,7 +451,7 @@ async def sync_pipeline_run(session, run_id):
 
     if not run.items:
         run.status = "FAILED"
-        run.error_message = "Pipeline has no items."
+        run.error_message = "این اجرا هیچ آیتمی ندارد."
         return run
 
     statuses = []
@@ -445,7 +483,7 @@ async def sync_pipeline_run(session, run_id):
         await _auto_publish_ready_targets(session, run)
     elif any(status in {"FAILED", "CANCELLED"} for status in statuses):
         run.status = "FAILED"
-        run.error_message = "One or more quality jobs failed."
+        run.error_message = "یک یا چند کارِ کیفیت شکست خورده است."
     else:
         run.status = "RUNNING"
 
