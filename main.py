@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.enums import ChatType
 from aiogram.types import BotCommand
 
 from app.bot.app import create_bot
@@ -72,6 +73,10 @@ async def register_error_handler(dp) -> None:
                 # در run_polling هر تلاش، باتِ جاری در workflow_data ثبت می‌شود.
                 bot = dp.workflow_data.get("bot")
             if chat is not None and bot is not None:
+                # [PRIVATE-ONLY] پیام خطا فقط در گفتگوی خصوصی فرستاده می‌شود؛
+                # در گروه/کانال چیزی برای اعضای دیگر پست نمی‌شود (فقط لاگ).
+                if str(getattr(chat, "type", "")) != ChatType.PRIVATE:
+                    return True
                 await bot.send_message(
                     chat.id,
                     "⚠️ خطایی رخ داد. لطفاً دوباره تلاش کنید یا از /start استفاده کنید.",
