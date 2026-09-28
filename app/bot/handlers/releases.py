@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import html
+import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from app.core.config import settings
 from app.runtime.db import session_scope
@@ -21,6 +22,8 @@ from app.db.models import DownloadHistory, Subscription, Title
 
 
 router = Router(name="releases")
+
+logger = logging.getLogger(__name__)
 
 
 # [P1-14] سهمیه‌ی روزانه باید بر پایه‌ی «روز تقویمی ایران» شمرده شود، نه نیمه‌شبِ
@@ -46,11 +49,11 @@ def _tehran_day_start_utc() -> datetime:
 
 
 async def _tehran_daily_download_count(session, *, user_id) -> int:
-    """تعداد دانلود موفق «امروز» از نگاه کاربر (روز تقویمی تهران).
+    """تعداد دانلود موفق «امروز» از نگاه کاربر (روز تقویمی تهران) — مبنای سهمیه‌ی روزانه.
 
-    همان پرس‌وجوی growth.daily_download_count است؛ فقط مرزِ «امروز» به‌جای
-    date_trunc روی منطقه‌ی زمانی DB با _tehran_day_start_utc() حساب می‌شود
-    (یعنی دانلود ساعت ۰۰:۳۰ تهران = ۲۱:۰۰ UTCِ روزِ قبل، به روزِ تازه می‌رود).
+    [P1-14] مرزِ «امروز» با _tehran_day_start_utc() حساب می‌شود، نه date_trunc روی
+    منطقه‌ی زمانی DB (یعنی دانلود ساعت ۰۰:۳۰ تهران = ۲۱:۰۰ UTCِ روزِ قبل، به روزِ
+    تازه می‌رود).
     """
     return int(
         await session.scalar(
@@ -139,11 +142,35 @@ async def download_release(callback: CallbackQuery):
         if not row:
             await callback.message.answer("نسخه پیدا نشد.")
             return
+        # [P2/IDOR] can_access_release فقط وضعیت خود Release را می‌بیند؛ نسخه‌ای که
+        # عنوانِ مادرش حذف/تakedown شده با دکمه‌ی اینلاینِ قدیمی قابل دانلود می‌ماند.
+        # وضعیت عنوانِ مادر (content_title_id از get_release_variant) هم باید عمومی باشد.
+        title_status = None
+        if row.get("content_title_id"):
+            title_status = await session.scalar(
+                select(Title.status).where(Title.id == row["content_title_id"])
+            )
+        if str(title_status or "").upper() not in {"PUBLISHED", "ACTIVE", "PUBLIC"}:
+            await callback.message.answer("این مورد در دسترس نیست.")
+            return
         user = await ensure_user(session, callback.from_user)
         allowed, reason = await can_access_release(session, user.id, release_id)
         if not allowed:
             await callback.message.answer(reason)
             return
+        target = delivery_target(row)
+        if not target:
+            await callback.message.answer("فایل این نسخه هنوز به Telegram Storage متصل نیست.")
+            return
+        # [P2/TOCTOU] شمارش سهمیه + ثبت دانلود باید در «یک» تراکنش اتمیک اتفاق بیفتد؛
+        # وگرنه N فشارِ همزمان روی دکمه همه از سهمیه رد می‌شوند (count-then-act در دو
+        # نشست جدا). قفل مشورتی تراکنشیِ Postgres روی شناسه‌ی کاربر، فشارهای همزمانِ
+        # همان کاربر را سری می‌کند (کاربران دیگر را نمی‌بندد)؛ قفل با پایان تراکنش
+        # (commit/rollback در session_scope) خودکار آزاد می‌شود.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:uid))"),
+            {"uid": str(user.id)},
+        )
         # 🛡 سهمیه دانلود روزانه برای کاربران بدون اشتراک معتبر (ادمین و اشتراکِ فعال = نامحدود)
         # [INT-c/M4] FREE_DAILY_DOWNLOAD_LIMIT=0 یعنی «صفر»، نه «نامحدود»:
         # شرط قبلی `if limit and limit > 0` با 0 کل بلوک سهمیه را رد می‌کرد و
@@ -175,18 +202,23 @@ async def download_release(callback: CallbackQuery):
                         ]),
                     )
                     return
-        target = delivery_target(row)
-    if not target:
-        await callback.message.answer("فایل این نسخه هنوز به Telegram Storage متصل نیست.")
-        return
+        # ثبت دانلود داخل همان قفل (همان معنای growth.record_download) — بعد از خروج
+        # از این نشست، سهمیه قطعاً رزرو شده است (بدون پنجره‌ی مسابقه).
+        await record_download(session, user_id=user.id, release_id=release_id)
+    # تراکنش سهمیه/ثبت کامیت شد؛ قفل آزاد شد — حالا فایل کپی می‌شود.
     try:
         await callback.bot.copy_message(chat_id=callback.from_user.id, from_chat_id=target[0], message_id=target[1])
     except Exception:
+        # [P2/TOCTOU] اگر کپی بعد از رزروِ سهمیه شکست بخورد، دانلود محافظه‌کارانه همچنان
+        # شمرده شده است (بدون برگشتِ سهمیه) — باید لاگ شود.
+        logger.warning(
+            "copy_message failed after quota-recorded download (release_id=%s chat=%s) — download remains counted",
+            release_id,
+            callback.from_user.id,
+            exc_info=True,
+        )
         await callback.message.answer("ارسال فایل انجام نشد. وضعیت Storage را بررسی کنید.")
         return
-    # ثبت آمار دانلود (پایه «پربازدیدها» و گزارش‌ها)
-    async with session_scope() as session:
-        await record_download(session, user_id=user.id, release_id=release_id)
     await callback.message.answer("نسخه انتخابی برای شما ارسال شد. ✅")
     # ⭐ امتیازدهی کیفیت
     await callback.message.answer(

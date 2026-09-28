@@ -5,6 +5,7 @@ import uuid
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.admin import _request_meta, admin_gate, router
 from app.bot.session import make_bot
@@ -183,8 +184,13 @@ async def membership_channel_create(payload: MembershipChannelPayload, request: 
             required=payload.required,
             active=payload.active,
         )
-        session.add(row)
-        await session.flush()
+        # [FIX-C] مسابقه‌ی precheck/insert روی uq_membership_channels_chat →
+        # ۴۰۹ به‌جای ۵۰۰ (پیش‌بررسی ۴۰۹ بالاتر دست‌نخورده ماند).
+        try:
+            session.add(row)
+            await session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="رکورد تکراری است.") from exc
         await record_admin_action(
             session,
             action="MEMBERSHIP_CHANNEL_CREATE",

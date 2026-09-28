@@ -6,7 +6,8 @@ services:
     environment:
       POSTGRES_DB: cinema_vault
       POSTGRES_USER: cinema_vault
-      POSTGRES_PASSWORD: CHANGE_ME
+      # [FIX-E] از env بخوان (پیش‌فرض placeholder) — رمز واقعی فقط در .env/محیط
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME}
     ports:
       # Bind to loopback only: Postgres must not be reachable from the internet
       # (or from other machines on the LAN); the app connects via localhost.

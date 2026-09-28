@@ -26,16 +26,34 @@ _JOINED_STATUSES = {"creator", "administrator", "member", "restricted"}
 
 # ---------- Runtime toggle (فعال/غیرفعال کردن دروازه از پنل) ----------
 
+# [FIX-E] کش mtime برای membership.json: gate_enabled روی هر پیام gated صدا زده
+# می‌شود و read_text() همگام در هر بار، هر پیام را کند می‌کرد؛ فقط وقتی st_mtime
+# تغییر کند فایل دوباره خوانده می‌شود. مقدار برگشتی «کپی» است تا caller نتواند کش را آلوده کند.
+_CONFIG_CACHE: dict[str, tuple[float, dict]] = {}
+
+
 def load_gate_config() -> dict:
-    if not CONFIG_PATH.exists():
+    path_key = str(CONFIG_PATH)
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        # فایل نیست/در دسترس نیست — همان قرارداد قبلی (دروازه خاموش) + بی‌اعتبارسازی کش
+        _CONFIG_CACHE.pop(path_key, None)
         return {"enabled": False}
+    cached = _CONFIG_CACHE.get(path_key)
+    if cached is not None and cached[0] == mtime:
+        return dict(cached[1])
     try:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"enabled": False}
-    if not isinstance(raw, dict):
-        return {"enabled": False}
-    return {"enabled": bool(raw.get("enabled", False))}
+        parsed = {"enabled": False}
+    else:
+        if isinstance(raw, dict):
+            parsed = {"enabled": bool(raw.get("enabled", False))}
+        else:
+            parsed = {"enabled": False}
+    _CONFIG_CACHE[path_key] = (mtime, parsed)
+    return dict(parsed)
 
 
 def save_gate_config(*, enabled: bool) -> dict:
@@ -136,6 +154,11 @@ async def is_admin_user(session, telegram_user_id: int) -> bool:
         return True
     row = await session.scalar(select(User).where(User.telegram_user_id == telegram_user_id))
     if row is None:
+        return False
+    # [FIX-E] کاربر بن‌شده (status != ACTIVE) با نقش SUPER_ADMIN نباید از دروازه‌ی
+    # ادمین عبور کند (ads/membership) — نقش بدون وضعیت ACTIVE معتبر نیست؛
+    # rbac.has_role فقط نقش را چک می‌کند، پس چک وضعیت اینجاست.
+    if (getattr(row, "status", "ACTIVE") or "").upper() != "ACTIVE":
         return False
     from app.services.rbac import is_super_admin
 

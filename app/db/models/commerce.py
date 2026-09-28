@@ -28,6 +28,10 @@ class Plan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UniqueConstraint("code", name="uq_plans_code"),
         Index("ix_plans_active_sort", "active", "sort_order"),
         CheckConstraint("discount_percent >= 0 AND discount_percent <= 100", name="ck_plans_discount_percent"),
+        # [FIX-B] Zero/negative durations must never reach the settle paths
+        # (0-day plan = PAID zero-length subscription; negative shortens an
+        # active one). Enforced at ORM/migration level: 0018_plan_duration_check.
+        CheckConstraint("duration_days >= 1", name="ck_plans_duration_days"),
     )
 
     code: Mapped[str] = mapped_column(String(32), nullable=False)

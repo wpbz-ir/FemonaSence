@@ -6,7 +6,7 @@ from uuid import UUID
 
 from sqlalchemy import and_, func, or_, select, update
 
-from app.db.models import Coupon, CouponRedemption, CouponTargetUser, User
+from app.db.models import Coupon, CouponRedemption, CouponTargetUser
 from app.services.pricing import discounted_amount
 
 RESERVATION_TTL = timedelta(minutes=30)

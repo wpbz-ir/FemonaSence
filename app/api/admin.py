@@ -5,11 +5,13 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 
 from app.api.admin_auth import require_admin_token
 from app.core.config import settings
@@ -121,8 +123,11 @@ class ReleaseUpdate(BaseModel):
 
 
 class StorageRegister(BaseModel):
-    chat_id: int
-    message_id: int
+    # [FIX-C] BigInteger-guard: ستون‌های chat_id/message_id در storage_files
+    # BigInteger هستند؛ مقادیر خارج از بازه‌ی ۶۴-بیتی قبلاً DataError → ۵۰۰.
+    # chat_id می‌تواند منفی باشد (کانال/سوپرگروه تلگرام: -100...).
+    chat_id: Annotated[int, Field(ge=-9223372036854775808, le=9223372036854775807)]
+    message_id: Annotated[int, Field(ge=1, le=9223372036854775807)]
     file_unique_key: str = Field(min_length=1, max_length=255)
     filename: str | None = None
     file_id: str | None = None
@@ -147,8 +152,8 @@ class PlanCreate(BaseModel):
     name_fa: str = Field(min_length=1, max_length=120)
     name_en: str | None = None
     description: str | None = None
-    price_toman: Decimal = Field(default=Decimal("0"), ge=0)
-    price_irr: Decimal = Field(default=Decimal("0"), ge=0)
+    price_toman: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("99999999999999.99"))
+    price_irr: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("99999999999999.99"))
     duration_days: int = Field(ge=1, le=3650)
     rank: int = Field(default=0, ge=0, le=1000)
     discount_percent: int = Field(default=0, ge=0, le=100)
@@ -161,8 +166,8 @@ class PlanUpdate(BaseModel):
     name_fa: str | None = None
     name_en: str | None = None
     description: str | None = None
-    price_toman: Decimal | None = Field(default=None, ge=0)
-    price_irr: Decimal | None = Field(default=None, ge=0)
+    price_toman: Decimal | None = Field(default=None, ge=0, le=Decimal("99999999999999.99"))
+    price_irr: Decimal | None = Field(default=None, ge=0, le=Decimal("99999999999999.99"))
     duration_days: int | None = Field(default=None, ge=1, le=3650)
     rank: int | None = Field(default=None, ge=0, le=1000)
     discount_percent: int | None = Field(default=None, ge=0, le=100)
@@ -176,13 +181,16 @@ class JobPriority(BaseModel):
 
 
 async def admin_gate(request: Request):
-    require_admin_token(request)
+    # [FIX-C] limiter قبل از مقایسه‌ی توکن اجرا می‌شود؛ قبلاً تلاش‌های ناموفقِ توکن
+    # به enforce نمی‌رسیدند و brute-force آنلاینِ توکن ادمین محدود نشده می‌ماند.
+    # پارامترهای key/IP/limit و رفتار 429/503 عیناً قبلی است.
     try:
         await enforce("admin:" + (request.client.host if request.client else "unknown"), limit=240, window_seconds=60)
     except RateLimitExceeded as exc:
         raise HTTPException(status_code=429, detail="تعداد درخواست‌های پنل بیش از حد مجاز است.") from exc
     except RateLimitUnavailable as exc:
         raise HTTPException(status_code=503, detail="Rate limiter backend is unavailable.") from exc
+    require_admin_token(request)
 
 
 def _request_meta(request: Request) -> dict:
@@ -667,8 +675,13 @@ async def plan_create(payload: PlanCreate, request: Request):
         if exists:
             raise HTTPException(status_code=409, detail="کد پلن تکراری است.")
         row = Plan(**payload.model_dump())
-        session.add(row)
-        await session.flush()
+        # [FIX-C] مسابقه‌ی precheck/insert روی uq_plans_code: insert موازی قبلاً
+        # IntegrityError → ۵۰۰ می‌داد؛ الان ۴۰۹ (پیش‌بررسی ۴۰۹ دست‌نخورده ماند).
+        try:
+            session.add(row)
+            await session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="رکورد تکراری است.") from exc
         await record_admin_action(session, action="CREATE_PLAN", entity_type="plan", entity_id=row.id, **_request_meta(request))
         return {"id": str(row.id)}
 
@@ -947,8 +960,13 @@ async def bot_menu():
 
 @router.get("/ui", response_class=HTMLResponse)
 async def admin_ui():
+    # استثنای مستندشده: این مسیر خودِ پوسته‌ی لاگین است و public می‌ماند، اما
+    # [FIX-C] مثل /admin در main.py با no-store سرو می‌شود تا HTML لاگین کش نشود.
     html_path = Path(__file__).parent / "templates" / "admin.html"
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        html_path.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
 
 
 @router.get("/instance", dependencies=[Depends(admin_gate)])
@@ -972,7 +990,7 @@ class CouponCreate(BaseModel):
     active: bool = True
     scope_type: str = Field(pattern="^(ALL|PLAN|USERS)$")
     scope_plan_id: uuid.UUID | None = None
-    telegram_user_ids: list[int] = Field(default_factory=list)
+    telegram_user_ids: list[Annotated[int, Field(ge=1, le=9223372036854775807)]] = Field(default_factory=list)
 
 
 def _coupon_payload(c: Coupon, usage: dict) -> dict:
@@ -1064,8 +1082,13 @@ async def coupons_create(payload: CouponCreate, request: Request):
             scope_type=payload.scope_type,
             scope_plan_id=payload.scope_plan_id if payload.scope_type == "PLAN" else None,
         )
-        session.add(coupon)
-        await session.flush()
+        # [FIX-C] مسابقه‌ی precheck/insert روی uq_coupons_code → ۴۰۹ به‌جای ۵۰۰
+        # (پیش‌بررسی ۴۰۹ بالاتر در همین هندلر و منطق فعلی دست‌نخورده ماند).
+        try:
+            session.add(coupon)
+            await session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="رکورد تکراری است.") from exc
 
         if payload.scope_type == "USERS":
             telegram_ids = list({int(x) for x in payload.telegram_user_ids if int(x) > 0})

@@ -24,7 +24,8 @@ async def toggle_reaction(session, *, user_id, title_id, value: int) -> dict:
                 DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
                 RETURNING value
             )
-            SELECT COALESCE((SELECT value FROM deleted LIMIT 1), (SELECT value FROM upserted LIMIT 1), 0)
+            SELECT CASE WHEN EXISTS (SELECT 1 FROM deleted) THEN 0
+                        ELSE COALESCE((SELECT value FROM upserted LIMIT 1), 0) END
             """
         ),
         {"user_id": user_id, "title_id": title_id, "value": value},

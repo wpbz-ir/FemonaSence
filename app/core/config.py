@@ -10,13 +10,55 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _int_or_none(value: str | None) -> int | None:
+def _int_or_none(value: str | None, env_name: str) -> int | None:
     if not value or not value.strip():
         return None
     try:
         return int(value)
     except ValueError as exc:
-        raise RuntimeError("ADMIN_USER_ID باید یک عدد صحیح باشد.") from exc
+        # [FIX-E] نام متغیر در پیام خطا پارامتری شد — پیام قبلی همیشه
+        # ADMIN_USER_ID را مقصر می‌کرد حتی وقتی MAIN_CHANNEL_ID و… خراب بود.
+        raise RuntimeError(f"{env_name} باید یک عدد صحیح باشد.") from exc
+
+
+def _env_int(
+    name: str,
+    default: int,
+    lo: int | None = None,
+    hi: int | None = None,
+    *,
+    empty: int | None = None,
+) -> int:
+    """[FIX-E] خواندن env عددی بدون کرش در زمان import روی مقدار نامعتبر.
+
+    - unset → ``default`` (همان قرارداد ``os.getenv(name, default)``).
+    - مقدار غیرعددی → هشدار یک‌خطی روی stderr و بازگشت ``default``
+      (به‌جای traceback بی‌موردِ ``int()`` در سطح ماژول).
+    - «خالی صریح» (``VAR=``) → اگر ``empty`` داده شده باشد همان مقدار
+      (قرارداد قبلی‌ی ``or "0"`` — مثلاً FREE_DAILY_DOWNLOAD_LIMIT= یعنی 0)،
+      وگرنه ``default``.
+    - در انتها clamping با lo/hi — دقیقاً همان مرزهای max/min قبلی.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        value = default
+    elif raw.strip() == "":
+        value = default if empty is None else empty
+    else:
+        try:
+            value = int(raw.strip())
+        except (TypeError, ValueError):
+            print(
+                f"[config] WARNING: {name}={raw!r} is not an integer — "
+                f"using default {default}",
+                file=sys.stderr,
+            )
+            value = default
+    if lo is not None and value < lo:
+        value = lo
+    if hi is not None and value > hi:
+        value = hi
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +72,7 @@ class Settings:
     bot_token: str = field(
         default=os.getenv("BOT_TOKEN", "").strip(), repr=False
     )
-    admin_user_id: int | None = _int_or_none(os.getenv("ADMIN_USER_ID"))
+    admin_user_id: int | None = _int_or_none(os.getenv("ADMIN_USER_ID"), "ADMIN_USER_ID")
     database_url: str = field(
         repr=False,
         default=os.getenv(
@@ -39,10 +81,12 @@ class Settings:
         ).strip(),
     )
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
-    main_channel_id: int | None = _int_or_none(os.getenv("MAIN_CHANNEL_ID"))
+    main_channel_id: int | None = _int_or_none(os.getenv("MAIN_CHANNEL_ID"), "MAIN_CHANNEL_ID")
     main_channel_username: str = os.getenv("MAIN_CHANNEL_USERNAME", "").strip()
-    production_storage_chat_id: int | None = _int_or_none(os.getenv("PRODUCTION_STORAGE_CHAT_ID"))
-    test_storage_chat_id: int | None = _int_or_none(os.getenv("TEST_STORAGE_CHAT_ID"))
+    production_storage_chat_id: int | None = _int_or_none(
+        os.getenv("PRODUCTION_STORAGE_CHAT_ID"), "PRODUCTION_STORAGE_CHAT_ID"
+    )
+    test_storage_chat_id: int | None = _int_or_none(os.getenv("TEST_STORAGE_CHAT_ID"), "TEST_STORAGE_CHAT_ID")
     winapay_merchant_id: str = os.getenv("WINAPAY_MERCHANT_ID", "").strip()
     winapay_sandbox: bool = os.getenv("WINAPAY_SANDBOX", "1").strip().lower() in {
         "1", "true", "yes", "on"
@@ -67,18 +111,18 @@ class Settings:
     bot_username: str = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
     run_maintenance_in_bot: bool = os.getenv("RUN_MAINTENANCE_IN_BOT", "1").strip().lower() in {"1", "true", "yes", "on"}
     run_notifications_in_bot: bool = os.getenv("RUN_NOTIFICATIONS_IN_BOT", "1").strip().lower() in {"1", "true", "yes", "on"}
-    maintenance_interval_seconds: int = max(5, int(os.getenv("MAINTENANCE_INTERVAL_SECONDS", "15")))
+    maintenance_interval_seconds: int = _env_int("MAINTENANCE_INTERVAL_SECONDS", 15, lo=5)
     allowed_hosts: tuple[str, ...] = tuple(x.strip() for x in os.getenv("ALLOWED_HOSTS", "").split(",") if x.strip())
     content_rights_required: bool = os.getenv("CONTENT_RIGHTS_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}
     telegram_storage_required: bool = os.getenv("TELEGRAM_STORAGE_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}
     startup_validate: bool = os.getenv("STARTUP_VALIDATE", "1").strip().lower() in {"1", "true", "yes", "on"}
     # رشد و عملیات دوره‌ای
-    free_daily_download_limit: int = max(0, int(os.getenv("FREE_DAILY_DOWNLOAD_LIMIT", "5") or "0"))
-    referral_reward_irr: int = max(0, int(os.getenv("REFERRAL_REWARD_IRR", "100000") or "0"))
+    free_daily_download_limit: int = _env_int("FREE_DAILY_DOWNLOAD_LIMIT", 5, lo=0, empty=0)
+    referral_reward_irr: int = _env_int("REFERRAL_REWARD_IRR", 100000, lo=0, empty=0)
     winback_coupon_code: str = os.getenv("WINBACK_COUPON_CODE", "").strip()
     auto_backup_enabled: bool = os.getenv("AUTO_BACKUP_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
-    auto_backup_chat_id: int | None = _int_or_none(os.getenv("AUTO_BACKUP_CHAT_ID"))
-    auto_backup_hour: int = max(0, min(23, int(os.getenv("AUTO_BACKUP_HOUR", "3") or "3")))
+    auto_backup_chat_id: int | None = _int_or_none(os.getenv("AUTO_BACKUP_CHAT_ID"), "AUTO_BACKUP_CHAT_ID")
+    auto_backup_hour: int = _env_int("AUTO_BACKUP_HOUR", 3, lo=0, hi=23, empty=3)
 
 
 settings = Settings()

@@ -7,3 +7,9 @@ __pycache__/
 .vscode/
 .idea/
 *.log
+# [FIX-E] خروجی‌های محلی/اجرا — هرگز وارد Git نشوند
+data/
+*.db
+*.sqlite3
+media_work/
+backups/

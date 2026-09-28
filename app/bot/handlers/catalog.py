@@ -62,6 +62,27 @@ def _is_public_title(title: Title) -> bool:
     return str(getattr(title, "status", "")).upper() in {"PUBLISHED", "ACTIVE", "PUBLIC"}
 
 
+# [P1] سقف نمایش نظرها — ۳۰ تا ۵۰ نظر با بدنه‌ی تا ۳۵۰ نویسه، متنِ ~۱۳ تا ۵۰ هزار
+# نویسه می‌سازد که از سقف ۴۰۹۶ نویسه‌ی تلگرام می‌گذرد؛ edit شکست می‌خورد و
+# fallback ارسال هم شکست می‌خورد → هندلرِ نظرها روی عنوان‌های پرنظر مرده بود.
+COMMENTS_DISPLAY_LIMIT = 8
+MAX_MESSAGE_CHARS = 3800
+
+
+def _clamp_message_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> str:
+    """کوتاه‌سازی امنِ متن پیام به ~«limit» نویسه: برش روی مرزِ خط و افزودن «…».
+
+    برش روی مرزِ خط تضمین می‌کند تگ‌های HTML تک‌خطی (مثل <b>…</b>) و
+    entity‌های escape‌شده نصفه نمانند.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    if cut <= 0:
+        cut = limit
+    return text[:cut].rstrip() + "\n…"
+
+
 def _home_row():
     return [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")]
 
@@ -625,6 +646,8 @@ async def comments_callback(callback: CallbackQuery):
             await _edit_or_send(callback, "این عنوان در حال حاضر منتشر نشده است.", reply_markup=back_home_keyboard())
             return
         comments = await list_comments(session, title_id=title_id)
+    # [P1] فقط ۸ نظرِ تازه‌تر نمایش داده می‌شود (خروجی list_comments نزولی/جدیدترین اول است)
+    comments = comments[:COMMENTS_DISPLAY_LIMIT]
     lines = ["<b>💬 نظرهای کاربران</b>", ""]
     if not comments:
         lines.append("هنوز نظری ثبت نشده است.")
@@ -636,7 +659,8 @@ async def comments_callback(callback: CallbackQuery):
             )
             lines.append(f"<b>{_safe(name, 80)}</b>\n{_safe(item.get('body'), 350)}\n")
     await _edit_or_send(callback,
-        "\n".join(lines),
+        # [P1] کلامپ نهایی به ~۳۸۰۰ نویسه — حتی با ۸ نظرِ پرحجم، از سقف ۴۰۹۶ رد نمی‌شویم
+        _clamp_message_text("\n".join(lines)),
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✍️ نظر بده", callback_data=f"cv:comment:{title_id}")],
@@ -704,6 +728,8 @@ async def comment_message(message: Message, state: FSMContext):
         async with session_scope() as session:
             user = await ensure_user(session, message.from_user)
             if getattr(user, "status", "ACTIVE") != "ACTIVE":
+                # [P2] مثل مسیرهای هم‌سطح، state FSM هم پاک شود تا نشستِ نظر کهنه نماند
+                await state.clear()
                 await message.answer("حساب کاربری شما فعال نیست.", reply_markup=back_home_keyboard())
                 return
             title = await session.get(Title, title_id)
@@ -736,5 +762,18 @@ async def favorite_callback(callback: CallbackQuery):
         if not title or not _is_public_title(title):
             await _edit_or_send(callback, "این عنوان در حال حاضر منتشر نشده است.", reply_markup=back_home_keyboard())
             return
-        await toggle_favorite(session, user_id=user.id, title_id=title_id)
+        try:
+            await toggle_favorite(session, user_id=user.id, title_id=title_id)
+        except ValueError:
+            # [FIX-E] سقف ۱۰۰۰ علاقه‌مندی پر شده — پیام شفاف فارسی به کاربر؛ پاسِ
+            # دوم ممکن است تلگرام نپذیرد (پاس اول مصرف شده) → fallback به پیام چت.
+            try:
+                await callback.answer("سقف تعداد علاقه‌مندی‌ها پر شده است.", show_alert=True)
+            except Exception:
+                if callback.message is not None:
+                    try:
+                        await callback.message.answer("سقف تعداد علاقه‌مندی‌ها پر شده است.")
+                    except Exception:
+                        pass
+            return
     await _render_title(callback, title_id)

@@ -52,7 +52,12 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str | None 
     # [5-INT-b / 5-G12-c #6] سقف اندازه‌ی بدنه — قبل از request.body() تا یک بدنه‌ی
     # غیرمتعارف بزرگ در حافظه بارگذاری نشود (Content-Length غایب = نادیده؛ تلگرام همیشه می‌فرستد).
     content_length = request.headers.get("content-length", "")
-    if content_length.isdigit() and int(content_length) > MAX_WEBHOOK_BODY_BYTES:
+    # [FIX-C] isdigit() برای «²» هم True است ولی int() روی آن ValueError می‌دهد
+    # (۵۰۰). هدر غایب/خالی مثل قبل نادیده گرفته می‌شود؛ مقدار غیرعددی ASCII → 400؛
+    # مقدار عددی بالاتر از سقف → 413 (مطابق رفتار قبلی سقف بدنه).
+    if content_length and not (content_length.isascii() and content_length.isdecimal()):
+        raise HTTPException(status_code=400, detail="Invalid Content-Length")
+    if content_length.isascii() and content_length.isdecimal() and int(content_length) > MAX_WEBHOOK_BODY_BYTES:
         raise HTTPException(status_code=413, detail="Payload too large")
 
     raw = await request.body()

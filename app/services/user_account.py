@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from aiogram.types import User as TgUser
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from app.db.models import Role, User, Wallet, user_roles
@@ -110,17 +111,23 @@ async def ensure_super_admin(session, user) -> bool:
     if role is None:
         return False
 
+    # [FIX-E] RACE (user_roles PK): check-then-insert در بوت اولیه‌ی چندنمونه‌ای
+    # (ربات + ورکر + پنل هم‌زمان) هر دو «نبودن» را می‌بینند و تراکنش دوم با
+    # IntegrityError می‌میرد. INSERT ... ON CONFLICT DO NOTHING (بدون target —
+    # PK ترکیبی user_id/role_id کافی است) اتمی است؛ ردیف سپس دوباره خوانده
+    # می‌شود تا موفقیت واقعی گزارش شود.
+    await session.execute(
+        pg_insert(user_roles)
+        .values(
+            user_id=user.id,
+            role_id=role.id,
+        )
+        .on_conflict_do_nothing()
+    )
     assigned = await session.scalar(
         select(user_roles.c.user_id).where(
             user_roles.c.user_id == user.id,
             user_roles.c.role_id == role.id,
         )
     )
-    if assigned is None:
-        await session.execute(
-            user_roles.insert().values(
-                user_id=user.id,
-                role_id=role.id,
-            )
-        )
-    return True
+    return assigned is not None

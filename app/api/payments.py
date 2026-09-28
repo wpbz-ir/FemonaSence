@@ -11,7 +11,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select, text
 
 from app.core.config import settings
-from app.db.models import Order, PaymentAttempt, Plan, User
+# [FIX-C] Plan/User حذف شدند — در این ماژول استفاده نمی‌شدند (rg-verified).
+from app.db.models import Order, PaymentAttempt
 from app.runtime.db import session_scope
 from app.services.payment_sessions import resolve_payment_session
 from app.services.rate_limit import RateLimitExceeded, RateLimitUnavailable, enforce
@@ -266,7 +267,16 @@ async def winapay_callback(request: Request):
 
     if payment:
         return _payment_page("✅", "پرداخت با موفقیت تأیید شد. سرویس شما فعال شده است.")
-    return _payment_page("⚠️", "تأیید پرداخت ناموفق بود.")
+    # [FIX-C] مسیر شکستِ verify (settle None برگردانده → attempt FAILED + آزادسازی کد
+    # تخفیف در winapay_billing) دیگر 200 برنمی‌گرداند؛ با 200 درگاه retry نمی‌کرد و
+    # پرداختِ کسرشده تا ابد PENDING می‌ماند. 502 باعث تلاش مجدد درگاه می‌شود و
+    # dedup رویدادها (payment_webhook_events) replay ها را idempotent نگه می‌دارد.
+    # شاخه‌های AUTH_MISMATCH/missing-fields/!OK رفتار قبلی خود را دارند.
+    return _payment_page(
+        "⚠️",
+        "خطا در تایید پرداخت؛ مبلغ کسر شده حداکثر تا ۷۲ ساعت به‌صورت خودکار تسویه می‌شود.",
+        status_code=502,
+    )
 
 
 def _payment_page(icon: str, message: str, *, status_code: int = 200) -> HTMLResponse:

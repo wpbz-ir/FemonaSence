@@ -25,6 +25,7 @@ EXPECTED_MIGRATIONS = [
     "0015_production_state.py",
     "0016_commerce_discounts.py",
     "0017_ads_system.py",
+    "0018_plan_duration_check.py",
 ]
 
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hmac
 import logging
+import re
 import time
+import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -109,10 +111,13 @@ _CSP_EXEMPT_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"
 
 @app.middleware("http")
 async def request_context(request: Request, call_next):
-    import time
-    import uuid
-
-    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    # [FIX-C] مقدار x-request-id ارسالی کلاینت بدون اعتبارسنجی به هدر پاسخ بازتاب
+    # داده می‌شد؛ کاراکترهای CR/LF باعث LocalProtocolError در h11 و ۵۰۰ می‌شدند.
+    # فقط مقادیر امن [A-Za-z0-9\-_.]{1,64} پذیرفته می‌شوند، در غیر این صورت
+    # شناسه‌ی سرور-تولیدشده جایگزین می‌شود.
+    request_id = request.headers.get("x-request-id") or ""
+    if not re.fullmatch(r"[A-Za-z0-9\-_.]{1,64}", request_id):
+        request_id = uuid.uuid4().hex
     request.state.request_id = request_id
     started = time.perf_counter()
     response = await call_next(request)

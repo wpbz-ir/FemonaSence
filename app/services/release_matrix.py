@@ -82,7 +82,7 @@ async def list_release_variants(session, *, title_id) -> list[dict]:
                    sf.message_id AS storage_message_id,
                    sf.file_id AS storage_file_id_value,
                    sf.status AS storage_status,
-                   sf.extra_data AS storage_extra_data
+                   sf.metadata AS storage_extra_data
             FROM releases r
             LEFT JOIN episodes ep ON ep.id = r.episode_id
             LEFT JOIN seasons se ON se.id = ep.season_id
@@ -126,7 +126,7 @@ async def get_release_variant(session, *, release_id) -> dict | None:
                    sf.message_id AS storage_message_id,
                    sf.file_id AS storage_file_id_value,
                    sf.status AS storage_status,
-                   sf.extra_data AS storage_extra_data
+                   sf.metadata AS storage_extra_data
             FROM releases r
             LEFT JOIN episodes ep ON ep.id = r.episode_id
             LEFT JOIN seasons se ON se.id = ep.season_id

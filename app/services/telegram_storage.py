@@ -25,15 +25,22 @@ async def check_telegram_storage() -> dict:
 
     from app.bot.session import telegram_aiohttp_connector
 
+    # [FIX] The session-level ClientTimeout(total=30) was dead code: each
+    # client._json call passed timeout=self.timeout (total=3600) at the
+    # request level, and an explicit request timeout fully REPLACES the
+    # session one in aiohttp — so a hung endpoint could stall this health
+    # check for an hour. _json now accepts a per-request timeout override and
+    # every health-check call passes this short one explicitly.
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout, connector=telegram_aiohttp_connector()) as session:
-        me = await client._json(session, "getMe")
-        chat = await client._json(session, "getChat", params={"chat_id": chat_id})
+        me = await client._json(session, "getMe", timeout=timeout)
+        chat = await client._json(session, "getChat", params={"chat_id": chat_id}, timeout=timeout)
         try:
             member = await client._json(
                 session,
                 "getChatMember",
                 params={"chat_id": chat_id, "user_id": me["id"]},
+                timeout=timeout,
             )
         except TelegramMediaError as exc:
             member = {"error": str(exc)}

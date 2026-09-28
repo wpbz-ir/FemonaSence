@@ -236,7 +236,10 @@ class MediaWorker:
                     shutil.rmtree(self.settings.work_root / str(job["id"]), ignore_errors=True)
 
     async def _lease_heartbeat(self, job_id, stop: asyncio.Event):
-        """Keep the RUNNING job's lease alive while the transcode runs.
+        """Keep the RUNNING job's lease alive for the whole pipeline.
+
+        [P1 FIX] Covers download + transcode + upload/registration (it used to
+        start only at the transcode, so long downloads let the lease expire).
 
         Self-healing: this loop must NEVER exit on a transient DB blip. If it
         died silently, the lease would expire while the transcode keeps going,
@@ -324,6 +327,33 @@ class MediaWorker:
                     "Source StorageFile is not ready.",
                 )
 
+        # [P1 FIX] The lease heartbeat must start BEFORE the download, not
+        # just before the transcode: a slow (≤2.5 GB, ClientTimeout
+        # total=3600s) download exceeds lease_seconds (900s default) with no
+        # heartbeat, so recover_stale_jobs() requeued the still-RUNNING job
+        # while this worker was downloading it — duplicate transcode work and
+        # a lost output. The heartbeat now spans the WHOLE pipeline
+        # (download + transcode + upload/registration) and is stopped only
+        # after _download_transcode_publish returns (mark_succeeded committed)
+        # or fails; the finally also covers the cancel early-returns.
+        lease_stop = asyncio.Event()
+        lease_task = asyncio.create_task(self._lease_heartbeat(job_id, lease_stop))
+        try:
+            await self._download_transcode_publish(job, file_id, input_path, output_path)
+        finally:
+            lease_stop.set()
+            lease_task.cancel()
+            await asyncio.gather(lease_task, return_exceptions=True)
+
+    async def _download_transcode_publish(self, job: dict, file_id: str, input_path: Path, output_path: Path):
+        """Download -> probe -> transcode -> publish for one claimed job.
+
+        [P1 FIX] Runs with the per-job lease heartbeat already active (started
+        by process_job BEFORE the download), so every phase keeps the RUNNING
+        lease fresh until mark_succeeded has committed.
+        """
+        job_id = job["id"]
+
         await self.telegram.download_file(
             file_id=file_id,
             destination=input_path,
@@ -370,20 +400,13 @@ class MediaWorker:
             )
             await session.commit()
 
-        lease_stop = asyncio.Event()
-        lease_task = asyncio.create_task(self._lease_heartbeat(job_id, lease_stop))
-        try:
-            await transcode(
-                self.settings,
-                input_path,
-                output_path,
-                profile,
-                source_height,
-            )
-        finally:
-            lease_stop.set()
-            lease_task.cancel()
-            await asyncio.gather(lease_task, return_exceptions=True)
+        await transcode(
+            self.settings,
+            input_path,
+            output_path,
+            profile,
+            source_height,
+        )
 
         output_probe = await probe(self.settings, output_path)
         output_hash = _sha256(output_path)

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import UUID
 
-from aiogram.types import LabeledPrice
 from sqlalchemy import select
 
 from app.db.models import Order, Payment, PaymentAttempt, Plan, Subscription
 from app.services.subscription_reminders import schedule_subscription_reminders
 from app.services.coupons import redeem_coupon_for_order, reserve_coupon
 from app.services.pricing import plan_stars_price
+
+logger = logging.getLogger(__name__)
 
 
 def plan_stars(plan: Plan) -> int:
@@ -158,6 +159,11 @@ async def settle_star_payment(session, *, order, attempt, successful_payment):
     plan = await session.get(Plan, order.plan_id)
     if plan is None:
         raise ValueError("Plan سفارش پیدا نشد.")
+    # [FIX-B] Zero/negative-duration plans must never produce a PAID
+    # zero-length (or worse, shortening) subscription — DB-level guard lives in
+    # ck_plans_duration_days (migration 0018); this is the settle-path backstop.
+    if plan.duration_days is None or plan.duration_days < 1:
+        raise ValueError("مدت‌زمان اشتراک این پلن نامعتبر است؛ با پشتیبانی تماس بگیرید.")
 
     now = datetime.now(timezone.utc)
     active = await session.scalar(
@@ -192,5 +198,14 @@ async def settle_star_payment(session, *, order, attempt, successful_payment):
         await session.flush()
 
     await schedule_subscription_reminders(session, subscription)
-    await redeem_coupon_for_order(session, order_id=order.id)
+    # [FIX-B] Settle-time coupon revalidation must NOT roll back captured money:
+    # by this point the Stars charge is already captured (Telegram charged the
+    # user), so a deactivated/expired coupon raising ValueError here used to
+    # abort the whole settle (no Payment, no entitlement, no trace). The payment
+    # stands; the coupon row is simply not consumed and the operator sees the
+    # warning. Happy-path exactly-once semantics are unchanged.
+    try:
+        await redeem_coupon_for_order(session, order_id=order.id)
+    except ValueError as exc:
+        logger.warning("coupon settle revalidation failed for order %s: %s", order.id, exc)
     return payment

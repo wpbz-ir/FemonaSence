@@ -33,7 +33,9 @@ async def setup_commands(bot: Bot) -> None:
                 "set_my_commands failed (attempt %s/3) - is Telegram reachable?",
                 attempt,
             )
-            await asyncio.sleep(5)
+            # [P3] بعد از تلاشِ آخر، صبرِ بی‌دلیل قبل از ادامه‌ی استارتاپ لازم نیست
+            if attempt < 3:
+                await asyncio.sleep(5)
     logger.warning("Telegram unreachable at startup - continuing without set_my_commands")
 
 

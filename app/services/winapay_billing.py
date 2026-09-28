@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -25,6 +25,8 @@ from app.services.coupons import redeem_coupon_for_order, release_coupon_for_ord
 from app.services.pricing import plan_toman_price
 from app.services.subscription_reminders import schedule_subscription_reminders
 
+logger = logging.getLogger(__name__)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -37,7 +39,9 @@ def _order_number(prefix: str = "FMS") -> str:
 
 async def create_winapay_subscription_order(session, *, user_id, plan: Plan, coupon_code: str | None = None):
     base_price = Decimal(plan_toman_price(plan))
-    if base_price < 100:
+    # [FIX-B] Decimal NaN/Infinity compare False against < 100, so the old
+    # `base_price < 100` check silently passed NaN through to the gateway.
+    if (not base_price.is_finite()) or base_price < 100:
         raise ValueError("قیمت نهایی پلن برای ویناپی باید حداقل 100 تومان باشد.")
     price = base_price
     order = Order(
@@ -90,7 +94,8 @@ async def create_winapay_subscription_order(session, *, user_id, plan: Plan, cou
 
 async def create_winapay_wallet_order(session, *, user_id, amount_toman: Decimal):
     amount = Decimal(amount_toman)
-    if amount < 100:
+    # [FIX-B] is_finite guard: NaN < 100 is False → NaN used to pass to the gateway.
+    if (not amount.is_finite()) or amount < 100:
         raise ValueError("حداقل مبلغ شارژ کیف پول 100 تومان است.")
     order = Order(
         order_number=_order_number("FMW"),
@@ -128,7 +133,9 @@ async def create_winapay_wallet_order(session, *, user_id, amount_toman: Decimal
 
 async def prepare_winapay_payment(session, *, order: Order, attempt: PaymentAttempt, callback_url: str):
     amount = Decimal(order.amount_toman or attempt.requested_amount_toman or 0)
-    if amount < 100:
+    # [FIX-B] is_finite guard: Postgres numeric can carry NaN/Infinity and the old
+    # `amount < 100` check is False for NaN → NaN reached the gateway request.
+    if (not amount.is_finite()) or amount < 100:
         raise ValueError("مبلغ سفارش ویناپی نامعتبر است.")
     provider = WinaPayProvider()
     result = await provider.create_payment(
@@ -203,10 +210,26 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
         callback_payload=callback_payload,
     )
 
-    async def _verify_failure(message: str) -> None:
+    async def _verify_failure(message: str) -> Payment | None:
         """Persist a verify failure: FAILED attempt (with the raw callback payload)
         + release the coupon reservation so the per-user/max-uses quota is not
-        leaked until the 30-min TTL (canonical P1-13 / 4-G01-c finding 2)."""
+        leaked until the 30-min TTL (canonical P1-13 / 4-G01-c finding 2).
+
+        [FIX-B] Concurrent duplicate callback guard: a duplicate callback can hit
+        the gateway AFTER a parallel settle already consumed the Authority, so the
+        re-verify returns non-100 for an order that is ALREADY PAID. Re-read the
+        order inside this failure txn (FOR UPDATE — serializes against the other
+        settle's Phase B) and NEVER downgrade a PAID order's attempt to FAILED:
+        return its existing Payment instead, which the caller already treats as
+        "settled" (webhook event PROCESSED + success page). Returns None for a
+        genuine failure (caller keeps its FAILED/502 path)."""
+        fresh_order = await session.scalar(
+            select(Order).where(Order.id == order_id).with_for_update()
+        )
+        if fresh_order is not None and fresh_order.status == "PAID":
+            return await session.scalar(
+                select(Payment).where(Payment.order_id == order_id).order_by(Payment.created_at.desc())
+            )
         fresh_attempt = await session.scalar(
             select(PaymentAttempt)
             .where(PaymentAttempt.order_id == order_id, PaymentAttempt.provider == "WINAPAY")
@@ -218,20 +241,18 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
             fresh_attempt.error_message = (message or "verify_failed")[:4000]
             fresh_attempt.raw_callback = callback_payload
         await release_coupon_for_order(session, order_id=order_id)
+        return None
 
     if not result.success:
-        await _verify_failure(result.error_message or result.error_code or "verify_failed")
-        return None
+        return await _verify_failure(result.error_message or result.error_code or "verify_failed")
 
     # [P1-13][4-G08-c F7] Gateway Amount is MANDATORY in the verify response: a
     # missing amount is a verify FAILURE (never skip-compare), and any mismatch
     # now releases the coupon reservation (it used to leak the reservation).
     if result.amount is None:
-        await _verify_failure("پاسخ Verify ویناپی فاقد مبلغ است.")
-        return None
+        return await _verify_failure("پاسخ Verify ویناپی فاقد مبلغ است.")
     if Decimal(result.amount) != amount_toman:
-        await _verify_failure("مبلغ Verify شده با سفارش مطابقت ندارد.")
-        return None
+        return await _verify_failure("مبلغ Verify شده با سفارش مطابقت ندارد.")
 
     # [P1-13][4-G08-c F4] provider_reference must come from the VERIFY RESPONSE
     # only — the user-controlled callback RefID fallback is REMOVED (a forged RefID
@@ -239,8 +260,7 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
     # Missing/blank RefID in a Status=100 response is a verify failure too.
     provider_reference = str(result.provider_reference or "").strip()
     if not provider_reference:
-        await _verify_failure("RefID ویناپی در پاسخ Verify وجود ندارد.")
-        return None
+        return await _verify_failure("RefID ویناپی در پاسخ Verify وجود ندارد.")
 
     order = await session.scalar(
         select(Order).where(Order.id == order_id).with_for_update()
@@ -264,16 +284,36 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
         raise ValueError("تلاش پرداخت معتبر پیدا نشد.")
     attempt.raw_callback = callback_payload
 
+    # [FIX-B] Idempotency lookup is scoped to THIS order (mirror of the Stars
+    # settle path): if this exact order already settled with this RefID, return
+    # its Payment. A RefID is globally unique per gateway payment
+    # (uq_payments_provider_reference), so it must never mark a DIFFERENT order
+    # PAID from another order's payment row.
     existing = await session.scalar(
         select(Payment).where(
             Payment.provider == "WINAPAY",
             Payment.provider_reference == provider_reference,
+            Payment.order_id == order.id,
         )
     )
     if existing:
         order.status = "PAID"
         attempt.status = "PAID"
         return existing
+    # [FIX-B] Cross-order RefID collision: the same RefID already settled a
+    # DIFFERENT order. Do NOT mark THIS order PAID (that would capture money
+    # with no fulfillment) — raise so the caller's exception path marks the
+    # attempt FAILED and the anomaly is visible to the operator.
+    collision = await session.scalar(
+        select(Payment.order_id).where(
+            Payment.provider == "WINAPAY",
+            Payment.provider_reference == provider_reference,
+        )
+    )
+    if collision is not None:
+        raise ValueError(
+            f"RefID ویناپی {provider_reference} قبلاً برای سفارش دیگری ثبت شده است."
+        )
 
     payment = Payment(
         order_id=order.id,
@@ -322,6 +362,11 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
         plan = await session.get(Plan, order.plan_id)
         if plan is None:
             raise ValueError("Plan سفارش پیدا نشد.")
+        # [FIX-B] Zero/negative-duration plans must never produce a PAID
+        # zero-length (or worse, shortening) subscription — DB-level guard lives
+        # in ck_plans_duration_days (migration 0018); settle-path backstop here.
+        if plan.duration_days is None or plan.duration_days < 1:
+            raise ValueError("مدت‌زمان اشتراک این پلن نامعتبر است.")
         now = _now()
         active = await session.scalar(
             select(Subscription)
@@ -353,5 +398,13 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
             await session.flush()
         await schedule_subscription_reminders(session, subscription)
 
-    await redeem_coupon_for_order(session, order_id=order.id)
+    # [FIX-B] Same coupon-revalidation containment as the Stars settle path:
+    # the bank payment is already verified at this point, so a deactivated/
+    # expired coupon must not roll back the settlement (no Payment, no
+    # fulfillment, WinaPay 502-retry loop). Payment stands; coupon not consumed;
+    # operator sees the warning. Exactly-once happy path unchanged.
+    try:
+        await redeem_coupon_for_order(session, order_id=order.id)
+    except ValueError as exc:
+        logger.warning("coupon settle revalidation failed for order %s: %s", order.id, exc)
     return payment

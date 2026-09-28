@@ -33,6 +33,7 @@ async def create_subscription(
     session.add(subscription)
     await session.flush()
     await schedule_subscription_reminders(session, subscription)
-    await session.commit()
-    await session.refresh(subscription)
+    # [FIX-B] No mid-service commit: session_scope owns the txn boundary (commit
+    # on clean exit / rollback on exception). The old commit+refresh here split
+    # the atomic unit (subscription + reminders) for no in-app caller.
     return subscription

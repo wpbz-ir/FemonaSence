@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import re
 from decimal import Decimal
 from uuid import UUID
@@ -26,6 +27,8 @@ from app.services.winapay_billing import create_winapay_subscription_order, crea
 
 
 router = Router(name="payments")
+
+logger = logging.getLogger(__name__)
 
 # [5-INT-b] سقف منطقی شارژ کیف پول (تومان) — callbackهای cv:wallet:<int> بزرگ‌تر از این
 # مقدار بدون ساخت سفارش رد می‌شوند (پیام فارسی).
@@ -275,18 +278,29 @@ async def wallet_topup(callback: CallbackQuery):
             show_alert=True,
         )
         return
-    await callback.answer()
     if not _bank_payment_available():
+        await callback.answer()
         await callback.message.answer("پرداخت بانکی فقط پس از تنظیم Merchant ID و نشانی عمومی HTTPS فعال می‌شود.")
         return
-    async with session_scope() as session:
-        user = await ensure_user(session, callback.from_user)
-        if getattr(user, "status", "ACTIVE") != "ACTIVE":
-            await callback.message.answer("حساب کاربری شما فعال نیست.")
-            return
-        order, _attempt, token = await create_winapay_wallet_order(session, user_id=user.id, amount_toman=amount)
-        # [5-INT-b / P1-21] کامیتِ تکراری حذف شد — session_scope در خروج، تنها نقطه‌ی
-        # کامیت است؛ کامیت داخلی قبلی یک نقطه‌ی commit دومِ زائد بود.
+    # [FIX-B] cv:wallet:0..99 passes the max-cap above but
+    # create_winapay_wallet_order raises ValueError (min 100 Toman) — the old
+    # code left the user in dead-air. The plain callback.answer() moved AFTER
+    # the try so the show_alert answer below is the FIRST answer for this
+    # query (Telegram ignores a second answer on the same callback query).
+    try:
+        async with session_scope() as session:
+            user = await ensure_user(session, callback.from_user)
+            if getattr(user, "status", "ACTIVE") != "ACTIVE":
+                await callback.answer()
+                await callback.message.answer("حساب کاربری شما فعال نیست.")
+                return
+            order, _attempt, token = await create_winapay_wallet_order(session, user_id=user.id, amount_toman=amount)
+            # [5-INT-b / P1-21] کامیتِ تکراری حذف شد — session_scope در خروج، تنها نقطه‌ی
+            # کامیت است؛ کامیت داخلی قبلی یک نقطه‌ی commit دومِ زائد بود.
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await callback.answer()
     url = f"{settings.public_base_url}/payments/winapay/start/{token}"
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 ورود به درگاه", url=url)],
@@ -340,30 +354,70 @@ async def successful_payment(message: Message):
         await message.answer("پرداخت دریافت شد اما Payload معتبر نیست. پشتیبانی را در جریان بگذارید.")
         return
 
-    async with session_scope() as session:
-        current_user = await ensure_user(session, message.from_user)
-        order = await session.get(Order, order_id)
-        if order is None:
-            await message.answer("سفارش پیدا نشد. پشتیبانی را در جریان بگذارید.")
-            return
-        if order.user_id != current_user.id:
-            await message.answer("شناسه پرداخت با سفارش مطابقت ندارد. پشتیبانی را در جریان بگذارید.")
-            return
-        if payment.currency != "XTR":
-            await message.answer("واحد پرداخت نامعتبر است. پشتیبانی را در جریان بگذارید.")
-            return
-        attempt = await session.scalar(select(PaymentAttempt).where(PaymentAttempt.order_id == order.id, PaymentAttempt.provider == "TELEGRAM_STARS").order_by(PaymentAttempt.created_at.desc()))
-        if attempt is None:
-            await message.answer("تلاش پرداخت پیدا نشد. پشتیبانی را در جریان بگذارید.")
-            return
-        expected = int((order.extra_data or {}).get("telegram_stars") or int(attempt.requested_amount_irr))
-        if int(payment.total_amount) != expected:
-            await message.answer("مبلغ پرداخت‌شده با سفارش مطابقت ندارد. پشتیبانی را در جریان بگذارید.")
-            return
-        if order.status == "PAID":
-            await message.answer("این پرداخت قبلاً ثبت شده است.")
-            return
-        await settle_star_payment(session, order=order, attempt=attempt, successful_payment=payment)
+    # [FIX-B] The settle txn is wrapped so a settle failure (e.g. coupon/
+    # integrity error) AFTER Telegram captured the Stars charge can no longer
+    # leave the user silent and the PaymentAttempt without a trace.
+    # session_scope rolls the partial txn back before re-raising, so catching
+    # OUTSIDE the async-with is what prevents a partial-commit of settle state.
+    settle_error: Exception | None = None
+    try:
+        async with session_scope() as session:
+            current_user = await ensure_user(session, message.from_user)
+            order = await session.get(Order, order_id)
+            if order is None:
+                await message.answer("سفارش پیدا نشد. پشتیبانی را در جریان بگذارید.")
+                return
+            if order.user_id != current_user.id:
+                await message.answer("شناسه پرداخت با سفارش مطابقت ندارد. پشتیبانی را در جریان بگذارید.")
+                return
+            if payment.currency != "XTR":
+                await message.answer("واحد پرداخت نامعتبر است. پشتیبانی را در جریان بگذارید.")
+                return
+            attempt = await session.scalar(select(PaymentAttempt).where(PaymentAttempt.order_id == order.id, PaymentAttempt.provider == "TELEGRAM_STARS").order_by(PaymentAttempt.created_at.desc()))
+            if attempt is None:
+                await message.answer("تلاش پرداخت پیدا نشد. پشتیبانی را در جریان بگذارید.")
+                return
+            expected = int((order.extra_data or {}).get("telegram_stars") or int(attempt.requested_amount_irr))
+            if int(payment.total_amount) != expected:
+                await message.answer("مبلغ پرداخت‌شده با سفارش مطابقت ندارد. پشتیبانی را در جریان بگذارید.")
+                return
+            if order.status == "PAID":
+                await message.answer("این پرداخت قبلاً ثبت شده است.")
+                return
+            await settle_star_payment(session, order=order, attempt=attempt, successful_payment=payment)
+    except Exception as exc:
+        settle_error = exc
+        logger.error("Stars settle failed for order %s", order_id, exc_info=True)
+
+    if settle_error is not None:
+        # Best-effort trace in a FRESH short txn: persist the attempt as FAILED
+        # (only when it exists and is not already PAID — a PAID attempt means the
+        # settle actually committed and only the post-commit path failed).
+        try:
+            async with session_scope() as session:
+                failed_attempt = await session.scalar(
+                    select(PaymentAttempt)
+                    .where(
+                        PaymentAttempt.order_id == order_id,
+                        PaymentAttempt.provider == "TELEGRAM_STARS",
+                    )
+                    .order_by(PaymentAttempt.created_at.desc())
+                )
+                if failed_attempt is not None and failed_attempt.status != "PAID":
+                    failed_attempt.status = "FAILED"
+                    failed_attempt.error_message = (
+                        str(settle_error) or settle_error.__class__.__name__
+                    )[:4000]
+        except Exception:
+            logger.exception("could not persist FAILED PaymentAttempt for order %s", order_id)
+        # Never leave a charged user silent — notify OUTSIDE any DB txn.
+        try:
+            await message.answer(
+                "پرداخت شما ثبت شد اما در فعال‌سازی اشتراک مشکلی پیش آمد. با پشتیبانی تماس بگیرید."
+            )
+        except Exception:
+            logger.exception("could not deliver settle-failure notice for order %s", order_id)
+        return
 
     await message.answer(
         "<b>✅ پرداخت با موفقیت ثبت شد</b>\n\nاشتراک شما فعال شد. تاریخ پایان را می‌توانید از «حساب کاربری» ببینید."

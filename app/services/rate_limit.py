@@ -70,9 +70,13 @@ async def hit(key: str, *, limit: int, window_seconds: int) -> RateLimitResult:
     redis = Redis.from_url(redis_url, decode_responses=True)
     try:
         redis_key = f"cv:rl:{key}"
+        # [FIX-E] اتمیک‌کردن ساخت کلید: ترتیب قبلی INCR سپس EXPIRE بود؛ اگر
+        # EXPIRE گم می‌شد (کرش/قطعی بین دو فراخوانی) کلید بدون TTL می‌ماند و
+        # throttle ابدی می‌شد. حالا SET NX EX کلید را همیشه با TTL می‌سازد و
+        # INCR بعد از آن فقط شمارش را بالا می‌برد (اولین درخواست پنجره: 0+1=1).
+        # بقیه‌ی رفتار (fail-open و ...) بدون تغییر.
+        await redis.set(redis_key, 0, ex=max(1, int(window_seconds)), nx=True)
         count = int(await redis.incr(redis_key))
-        if count == 1:
-            await redis.expire(redis_key, max(1, int(window_seconds)))
         allowed = count <= max(1, int(limit))
         if not allowed:
             raise RateLimitExceeded("Too many requests.")

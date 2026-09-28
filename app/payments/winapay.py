@@ -110,7 +110,10 @@ class WinaPayProvider:
                 error_message="Merchant ID تنظیم نشده است.",
             )
         amount = _quantize_amount(amount_toman, context="PaymentRequest")
-        if amount < 100:
+        # [FIX-B] is_finite guard: Decimal NaN compares False against < 100, so a
+        # NaN amount used to slip past this check and be sent to the gateway as
+        # the Amount field. (Infinity already fails quantize above; NaN does not.)
+        if (not amount.is_finite()) or amount < 100:
             return PaymentStartResult(
                 success=False,
                 error_code="WINAPAY_AMOUNT_INVALID",

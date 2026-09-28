@@ -8,6 +8,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import text
 
 from app.core.config import settings
 from app.runtime.db import session_scope
@@ -212,6 +213,16 @@ async def ads_receive_content(message: Message, state: FSMContext):
             continue
 
 
+# [P3] catch-all: استیکر/وویس/آدیو/ویودیو-نوت و هر فرمت دیگرِ پشتیبانی‌نشده —
+# اگر گرفته نشود، هیچ هندلری در این state آن را نمی‌پذیرد و کاربر در سکوتِ کامل
+# می‌ماند (FSM گیر می‌کند). state عمداً پاک نمی‌شود تا کاربر بتواند فرمت درست
+# را بفرستد.
+@router.message(AdRequestState.waiting_content)
+async def ads_receive_unsupported_format(message: Message, state: FSMContext):
+    """هر محتوای پشتیبانی‌نشده در حالت انتظار محتوای تبلیغ — پاسخ فارسی بدون پاک‌کردن state."""
+    await message.answer("فرمت ارسالی پشتیبانی نمی‌شود. متن، عکس، ویدیو، انیمیشن یا فایل بفرستید.")
+
+
 async def _notify_admin(bot, admin_id: int, admin_text: str, request) -> None:
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -321,6 +332,13 @@ async def ads_publish(callback: CallbackQuery):
         await callback.answer("شناسه درخواست نامعتبر است.", show_alert=True)
         return
     async with session_scope() as session:
+        # [P2] قفل مشورتی تراکنشی روی شناسه‌ی درخواست: دو فشارِ همزمانِ «انتشار» سری
+        # می‌شوند تا فقط یکی جریان انتشار را ادامه دهد؛ فشار دوم پس از صبر، وضعیت
+        # نهایی (PUBLISHED) را می‌بیند و پیام «قبلاً منتشر شده» می‌گیرد.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:rid))"),
+            {"rid": str(request_id)},
+        )
         row = await get_ad_request(session, request_id)
         target = _channel_target(await get_or_create_ad_settings(session))
     if row is None or row.status == "REJECTED":
@@ -330,7 +348,7 @@ async def ads_publish(callback: CallbackQuery):
         await callback.answer("ابتدا درخواست را تأیید کنید", show_alert=True)
         return
     if row.status == "PUBLISHED":
-        await callback.answer("این درخواست قبلاً منتشر شده است", show_alert=True)
+        await callback.answer("این تبلیغ قبلاً منتشر شده است.", show_alert=True)
         return
     if row.status != "APPROVED":
         await callback.answer("این درخواست قابل انتشار نیست.", show_alert=True)
@@ -341,7 +359,14 @@ async def ads_publish(callback: CallbackQuery):
     if await _publish_to_channel(callback.bot, target, request_id):
         await callback.answer("📤 در کانال تبلیغات منتشر شد.")
     else:
-        await callback.answer("انتشار انجام نشد؛ دسترسی ربات به کانال را بررسی کنید.", show_alert=True)
+        # [P2] اگر همزمان ادمین دیگری همین درخواست را زیر قفل منتشر کرده باشد،
+        # پیامِ درست «قبلاً منتشر شده» است، نه «انتشار انجام نشد».
+        async with session_scope() as session:
+            row_now = await get_ad_request(session, request_id)
+        if row_now is not None and (row_now.status or "").upper() == "PUBLISHED":
+            await callback.answer("این تبلیغ قبلاً منتشر شده است.", show_alert=True)
+        else:
+            await callback.answer("انتشار انجام نشد؛ دسترسی ربات به کانال را بررسی کنید.", show_alert=True)
 
 
 async def _reviewer_id(session, telegram_user_id: int):
@@ -353,55 +378,68 @@ async def _reviewer_id(session, telegram_user_id: int):
 
 
 async def _publish_to_channel(bot, target: str, request_id) -> bool:
-    """انتشار درخواست تأییدشده در کانال تبلیغات؛ کپی از پیام اصلی با fallback به file_id."""
+    """انتشار درخواست تأییدشده در کانال تبلیغات؛ کپی از پیام اصلی با fallback به file_id.
+
+    [P2] کل چرخه‌ی انتشار (خواندن وضعیت → ارسال در کانال → گذار PUBLISHED) داخل
+    «یک» تراکنش و زیر قفل مشورتی تراکنشیِ روی شناسه‌ی درخواست انجام می‌شود تا دو
+    فشارِ همزمانِ «انتشار» هرگز دو پست تکراری در کانال نسازند؛ فشار دوم پس از صبر،
+    وضعیتِ به‌روزشده را می‌بیند و بدون ارسالِ تازه خارج می‌شود.
+    """
     from app.db.models import AdRequest
 
     async with session_scope() as session:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:rid))"),
+            {"rid": str(request_id)},
+        )
         row = await session.get(AdRequest, request_id)
         if row is None:
+            return False
+        # بررسیِ مجددِ وضعیت زیر قفل: ردیف ممکن است همزمان توسط ادمین دیگری
+        # منتشر یا رد شده باشد → بدون ارسالِ تازه خارج می‌شویم (بدون پست تکراری).
+        if (row.status or "").upper() != "APPROVED":
             return False
         content_type = row.content_type
         file_id = row.telegram_file_id
         source_chat, source_message = row.source_chat_id, row.source_message_id
         content_text = row.content_text or "آگهی تبلیغاتی"
 
-    sent = None
-    if source_chat and source_message:
-        try:
-            sent = await bot.copy_message(chat_id=target, from_chat_id=source_chat, message_id=source_message)
-        except Exception:
-            sent = None
-    if sent is None and file_id:
-        try:
-            if content_type == "PHOTO":
-                sent = await bot.send_photo(target, file_id)
-            elif content_type == "VIDEO":
-                sent = await bot.send_video(target, file_id)
-            elif content_type == "ANIMATION":
-                sent = await bot.send_animation(target, file_id)
-            elif content_type == "DOCUMENT":
-                sent = await bot.send_document(target, file_id)
-        except Exception:
-            sent = None
-    if sent is None and content_type == "TEXT":
-        try:
-            sent = await bot.send_message(target, html.escape(content_text))
-        except Exception:
-            sent = None
-    if sent is None:
-        return False
-    async with session_scope() as session:
-        row = await session.get(AdRequest, request_id)
-        if row is not None:
-            # گذار APPROVED→PUBLISHED از دستگاه وضعیت (G19-a) عبور می‌کند، نه نوشتن مستقیم؛
-            # reviewed_by حفظ می‌شود تا ممیزی از دست نرود.
+        sent = None
+        if source_chat and source_message:
             try:
-                await set_ad_request_status(
-                    session, request_id, status="PUBLISHED", admin_note=None,
-                    reviewer_user_id=row.reviewed_by,
-                )
-            except ValueError:
-                # ردیف هم‌زمان توسط ادمین دیگری رد/منتشر شده — انتشارِ وضعیت را بی‌اثر می‌کنیم.
-                return False
-            row.published_message_id = sent.message_id
+                sent = await bot.copy_message(chat_id=target, from_chat_id=source_chat, message_id=source_message)
+            except Exception:
+                sent = None
+        if sent is None and file_id:
+            try:
+                if content_type == "PHOTO":
+                    sent = await bot.send_photo(target, file_id)
+                elif content_type == "VIDEO":
+                    sent = await bot.send_video(target, file_id)
+                elif content_type == "ANIMATION":
+                    sent = await bot.send_animation(target, file_id)
+                elif content_type == "DOCUMENT":
+                    sent = await bot.send_document(target, file_id)
+            except Exception:
+                sent = None
+        if sent is None and content_type == "TEXT":
+            try:
+                # [P2] متن pre-escape شده (html.escape) است؛ parse_mode="HTML" صریح
+                # می‌شود تا «&amp;» و امثال آن در کانال به‌صورت درست رندر شوند، نه لفظی.
+                sent = await bot.send_message(target, html.escape(content_text), parse_mode="HTML")
+            except Exception:
+                sent = None
+        if sent is None:
+            return False
+        # گذار APPROVED→PUBLISHED از دستگاه وضعیت (G19-a) عبور می‌کند، نه نوشتن مستقیم؛
+        # reviewed_by حفظ می‌شود تا ممیزی از دست نرود.
+        try:
+            await set_ad_request_status(
+                session, request_id, status="PUBLISHED", admin_note=None,
+                reviewer_user_id=row.reviewed_by,
+            )
+        except ValueError:
+            # ردیف همزمان توسط ادمین دیگری رد/منتشر شده — انتشارِ وضعیت را بی‌اثر می‌کنیم.
+            return False
+        row.published_message_id = sent.message_id
     return True

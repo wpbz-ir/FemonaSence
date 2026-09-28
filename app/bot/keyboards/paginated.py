@@ -33,11 +33,14 @@ def paginated_grid(
 ) -> InlineKeyboardMarkup:
     """Compact grid keyboard with prev/next paging; shared by genres, actors, collections and years."""
     items = list(items)
+    # [P3] مقاوم‌سازی ورودی: page_size نامعتبر (0/منفی/غیرعددی) نباید ZeroDivisionError
+    # یا TypeError بدهد؛ حداقل ۱ در هر صفحه.
+    page_size = max(1, int(page_size))
     pages = max(1, (len(items) + page_size - 1) // page_size)
     page = min(max(page, 0), pages - 1)
     chunk = items[page * page_size : (page + 1) * page_size]
 
-    labels = [_short(f"{prefix}{label(x)}", 22) for x in chunk]
+    labels = [_short(f"{prefix}{label(x) or ''}", 22) for x in chunk]
     cols = _columns_for(labels)
     buttons = [
         InlineKeyboardButton(text=text, callback_data=callback(item))
@@ -55,4 +58,7 @@ def paginated_grid(
         rows.append(nav)
 
     rows.extend([list(r) for r in footer])
+    if not rows:
+        # [P3] کیبورد خالی در تلگرام خطا می‌دهد؛ ردیف «موردی نیست» (دکمه‌ی بی‌اثر noop)
+        rows.append([InlineKeyboardButton(text="موردی نیست", callback_data="noop")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

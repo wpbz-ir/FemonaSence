@@ -33,6 +33,16 @@ async def _run(*args: str, cwd: Path | None = None, timeout: float = 120.0) -> t
             "FFMPEG_TIMEOUT",
             f"process did not finish within {int(timeout)} seconds",
         ) from None
+    except asyncio.CancelledError:
+        # [FIX] Outer cancellation (worker shutdown / task cancel) must not
+        # leak the child process: kill it and re-raise so cancellation
+        # semantics are preserved.
+        process.kill()
+        try:
+            await process.wait()
+        except Exception:
+            pass
+        raise
     return process.returncode, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace")
 
 
@@ -56,7 +66,13 @@ async def probe(settings: MediaSettings, input_path: Path) -> dict:
     videos = [s for s in streams if s.get("codec_type") == "video"]
     if not videos:
         raise FFmpegError("NO_VIDEO_STREAM", "Input contains no video stream")
-    duration = float((data.get("format") or {}).get("duration") or videos[0].get("duration") or 0)
+    # [FIX] ffprobe reports "N/A" (or other non-numeric junk) for duration on
+    # some containers; float() must not leak a bare ValueError — treat it as
+    # the same DURATION_UNKNOWN failure as a missing duration.
+    try:
+        duration = float((data.get("format") or {}).get("duration") or videos[0].get("duration") or 0)
+    except (TypeError, ValueError):
+        raise FFmpegError("DURATION_UNKNOWN", "Input duration could not be determined") from None
     if duration <= 0:
         raise FFmpegError("DURATION_UNKNOWN", "Input duration could not be determined")
     return {
@@ -75,7 +91,11 @@ async def probe(settings: MediaSettings, input_path: Path) -> dict:
 async def transcode(settings: MediaSettings, input_path: Path, output_path: Path, profile: TranscodeProfile, source_height: int) -> dict:
     if source_height <= 0:
         raise FFmpegError("SOURCE_HEIGHT_UNKNOWN", "Source video height is not known")
-    target_height = min(int(profile.height), int(source_height))
+    # [FIX] Even-height cap: when the source is smaller than the profile the
+    # minimum could land on an odd value (e.g. 479); scale=-2:479 keeps that
+    # odd height and libx264/yuv420p then fails on EVERY odd-height video.
+    # Floor to an even number so the filter never receives an odd target.
+    target_height = (min(int(profile.height), int(source_height)) // 2) * 2
     scale_expr = f"-2:{target_height}"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,11 +167,28 @@ async def transcode(settings: MediaSettings, input_path: Path, output_path: Path
             await process.wait()
         except Exception:
             pass
+        # Reap the cancelled stderr reader so no unretrieved-exception
+        # warning is emitted when the task object is garbage collected.
+        await asyncio.gather(stderr_task, return_exceptions=True)
         temp_path.unlink(missing_ok=True)
         raise FFmpegError(
             "FFMPEG_TIMEOUT",
             f"ffmpeg did not finish within {int(timeout_seconds)} seconds",
         ) from None
+    except asyncio.CancelledError:
+        # [FIX] Outer task cancellation (worker shutdown) previously skipped
+        # every cleanup: the ffmpeg child kept running and the .partial.mp4
+        # file stayed on disk. Kill the child, reap the stderr reader, unlink
+        # the partial output, then re-raise so cancellation still propagates.
+        stderr_task.cancel()
+        process.kill()
+        try:
+            await process.wait()
+        except Exception:
+            pass
+        await asyncio.gather(stderr_task, return_exceptions=True)
+        temp_path.unlink(missing_ok=True)
+        raise
     if code != 0 or not temp_path.exists() or temp_path.stat().st_size < 1024:
         temp_path.unlink(missing_ok=True)
         raise FFmpegError("FFMPEG_FAILED", last_error or f"ffmpeg exited with code {code}")

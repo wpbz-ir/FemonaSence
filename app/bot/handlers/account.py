@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from html import escape
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 
@@ -8,6 +12,14 @@ from app.db.models import Favorite, Subscription, Title, Wallet, WatchHistory
 from app.runtime.db import session_scope
 from app.services.catalog import title_text
 from app.services.user_account import ensure_user
+
+# [P2] نمایش تاریخ انقضا در منطقه‌ی زمانی تهران — همان الگوی releases.py:
+# ایران DST ندارد → Asia/Tehran همیشه UTC+03:30 ثابت است؛ اگر tzdb در دسترس
+# نباشد (مثلاً ویندوز بدون بسته‌ی tzdata)، همان آفست ثابت ساخته می‌شود.
+try:
+    TEHRAN_TZ = ZoneInfo("Asia/Tehran")
+except ZoneInfoNotFoundError:  # pragma: no cover - وابسته به محیط استقرار
+    TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 
 async def send_account(callback: CallbackQuery):
@@ -20,12 +32,19 @@ async def send_account(callback: CallbackQuery):
             .where(
                 Subscription.user_id == user.id,
                 Subscription.status == "ACTIVE",
+                # [P2] رکورد ACTIVE با expires_at گذشته، اشتراک معتبر نیست؛
+                # وگرنه «فعال تا <تاریخ گذشته>» برای اشتراک منقضی نشان داده می‌شد.
+                Subscription.expires_at >= datetime.now(timezone.utc),
             )
             .order_by(Subscription.expires_at.desc())
         )
 
     if sub:
-        subscription_text = f"فعال تا <code>{sub.expires_at}</code>"
+        expires_fa = escape(
+            sub.expires_at.astimezone(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M"),
+            quote=False,
+        )
+        subscription_text = f"فعال تا <code>{expires_fa}</code>"
     else:
         subscription_text = "فعال نیست"
 

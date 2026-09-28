@@ -4,13 +4,17 @@ import asyncio
 import logging
 import os
 import shutil
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import aiohttp
-from sqlalchemy import text
+from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.bot.session import telegram_aiohttp_connector
+from app.db.models import StorageFile
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +93,15 @@ class TelegramMediaClient:
             return None
         return resolved
 
-    async def _json(self, session, method: str, *, params=None, data=None):
-        async with session.post(self._url(method), params=params, data=data, timeout=self.timeout) as response:
+    async def _json(self, session, method: str, *, params=None, data=None, timeout=None):
+        # [FIX] Per-request timeout override: aiohttp lets an explicit
+        # request-level ClientTimeout fully REPLACE the session-level one
+        # (which otherwise stays self.timeout, total=3600). The storage health
+        # check passes a short total=30 timeout here so a hung endpoint cannot
+        # stall the health check for an hour.
+        async with session.post(
+            self._url(method), params=params, data=data, timeout=timeout or self.timeout
+        ) as response:
             payload = await response.json(content_type=None)
             if response.status >= 400 or not payload.get("ok"):
                 description = str(payload.get("description") or f"HTTP {response.status}")
@@ -143,15 +154,23 @@ class TelegramMediaClient:
                     raise TelegramMediaError("TELEGRAM_FILE_DOWNLOAD_FAILED", f"HTTP {response.status}")
                 received = 0
                 exceeded_cap = False
-                with destination.open("wb") as output:
-                    async for chunk in response.content.iter_chunked(1024 * 1024):
-                        received += len(chunk)
-                        # [INT-c] Running byte cap: the server may lie about (or
-                        # omit) file_size, so the stream itself is capped too.
-                        if received > MAX_DOWNLOAD_BYTES:
-                            exceeded_cap = True
-                            break
-                        await asyncio.to_thread(output.write, chunk)
+                try:
+                    with destination.open("wb") as output:
+                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                            received += len(chunk)
+                            # [INT-c] Running byte cap: the server may lie about (or
+                            # omit) file_size, so the stream itself is capped too.
+                            if received > MAX_DOWNLOAD_BYTES:
+                                exceeded_cap = True
+                                break
+                            await asyncio.to_thread(output.write, chunk)
+                except BaseException:
+                    # [FIX] Don't leave a multi-GB .partial file behind on a
+                    # network error, timeout or task cancellation either —
+                    # the with-block closes the handle before this unlink runs
+                    # (safe on Windows); the worker rmtree stays as backstop.
+                    destination.unlink(missing_ok=True)
+                    raise
                 if exceeded_cap:
                     # Close first (the with-block above), then unlink — safe on
                     # Windows too, where unlinking an open file fails.
@@ -165,12 +184,34 @@ class TelegramMediaClient:
     async def send_video(self, *, chat_id: int | str, path: Path, caption: str, width: int | None = None, height: int | None = None, duration: int | None = None) -> dict:
         if not path.exists():
             raise TelegramMediaError("OUTPUT_MISSING", "Output media does not exist")
+        # [FIX] Pre-send size guard: the cloud Bot API rejects sendVideo above
+        # 50 MB while a local Bot API server (--local) accepts up to 2 GB.
+        # Fail fast with a structured error BEFORE streaming minutes of
+        # multipart just to be rejected mid-upload.
+        max_send = 2_000_000_000 if self.local_bot_api else 49_000_000
+        output_size = path.stat().st_size
+        if output_size > max_send:
+            raise TelegramMediaError(
+                "OUTPUT_TOO_LARGE",
+                f"Output size {output_size} exceeds the "
+                f"{'local (2 GB)' if self.local_bot_api else 'cloud (50 MB)'} "
+                f"Bot API sendVideo limit of {max_send} bytes",
+            )
         # HTTP multipart is streamed by aiohttp; the worker does not load the video into RAM.
         with path.open("rb") as video_handle:
             form = aiohttp.FormData()
             form.add_field("chat_id", str(chat_id))
             form.add_field("caption", caption[:1024])
             form.add_field("supports_streaming", "true")
+            # [FIX] width/height/duration were accepted but never added to the
+            # multipart form, so storage rows built from the sendVideo result
+            # lost the transcoded dimensions forever.
+            if width is not None:
+                form.add_field("width", str(int(width)))
+            if height is not None:
+                form.add_field("height", str(int(height)))
+            if duration is not None:
+                form.add_field("duration", str(int(duration)))
             form.add_field(
                 "video",
                 video_handle,
@@ -190,7 +231,7 @@ async def find_storage_by_sha256(session, *, sha256: str):
             """
             SELECT id FROM storage_files
             WHERE status = 'READY'
-              AND COALESCE(extra_data->>'sha256', '') = :sha256
+              AND COALESCE(metadata->>'sha256', '') = :sha256
             ORDER BY created_at DESC
             LIMIT 1
             """
@@ -218,33 +259,53 @@ async def register_storage_file(session, *, provider_code: str, message: dict, s
     if existing:
         return existing
 
-    row = await session.scalar(
-        text(
-            """
-            INSERT INTO storage_files
-              (id, provider_id, chat_id, message_id, file_id, file_unique_key, filename,
-               mime_type, size_bytes, status, storage_scope, verified_at, extra_data, created_at)
-            VALUES
-              (gen_random_uuid(), :provider_id, :chat_id, :message_id, :file_id, :file_unique_key,
-               :filename, :mime_type, :size_bytes, 'READY', :storage_scope, :verified_at, CAST(:extra_data AS jsonb), CURRENT_TIMESTAMP)
-            RETURNING id
-            """
-        ),
-        {
-            "provider_id": provider,
-            "chat_id": message.get("chat", {}).get("id"),
-            "message_id": message.get("message_id"),
-            "file_id": video.get("file_id"),
-            "file_unique_key": unique_key,
-            "filename": video.get("file_name"),
-            "mime_type": video.get("mime_type") or "video/mp4",
-            "size_bytes": video.get("file_size"),
-            "storage_scope": "PRODUCTION",
-            "verified_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
-            "extra_data": __import__("json").dumps({"source": "media_worker", "job_id": str(source_job_id) if source_job_id else None, "sha256": sha256}, ensure_ascii=False),
-        },
+    # [FIX] SELECT-then-INSERT race on uq_storage_files_provider_unique: two
+    # concurrent workers registering the same Telegram video could both pass
+    # the pre-SELECT above and one died with an uncaught IntegrityError.
+    # Mirror storage_ingest.ingest_storage_message: INSERT ... ON CONFLICT DO
+    # NOTHING on the same constraint, then re-select the surviving row so both
+    # callers observe the same storage_files.id.
+    # NOTE: the physical column is `metadata` (the ORM attribute extra_data is
+    # mapped_column("metadata", JSONB)); the previous raw INSERT named the
+    # non-existent column `extra_data` and failed every registration with
+    # UndefinedColumn.
+    await session.execute(
+        pg_insert(StorageFile).values(
+            {
+                StorageFile.id: uuid.uuid4(),
+                StorageFile.provider_id: provider,
+                StorageFile.chat_id: message.get("chat", {}).get("id"),
+                StorageFile.message_id: message.get("message_id"),
+                StorageFile.file_id: video.get("file_id"),
+                StorageFile.file_unique_key: unique_key,
+                StorageFile.filename: video.get("file_name"),
+                StorageFile.mime_type: video.get("mime_type") or "video/mp4",
+                StorageFile.size_bytes: video.get("file_size"),
+                StorageFile.status: "READY",
+                StorageFile.storage_scope: "PRODUCTION",
+                StorageFile.verified_at: datetime.now(timezone.utc),
+                StorageFile.extra_data: {
+                    "source": "media_worker",
+                    "job_id": str(source_job_id) if source_job_id else None,
+                    "sha256": sha256,
+                },
+            }
+        ).on_conflict_do_nothing(constraint="uq_storage_files_provider_unique")
     )
-    return row
+    stored_id = await session.scalar(
+        select(StorageFile.id).where(
+            StorageFile.provider_id == provider,
+            StorageFile.file_unique_key == unique_key,
+        )
+    )
+    if stored_id is None:
+        # Unreachable unless the row vanished between insert and re-select;
+        # fail loudly instead of returning None to mark_succeeded/attach.
+        raise TelegramMediaError(
+            "STORAGE_REGISTER_LOST",
+            "storage_files row disappeared after conflict-safe registration",
+        )
+    return stored_id
 
 
 async def attach_storage_to_release(session, *, release_id, storage_file_id) -> None:

@@ -324,7 +324,12 @@ def check_database_contract() -> None:
         text = path.read_text(encoding="utf-8-sig")
         if "create_async_engine" not in text:
             continue
-        if "async_database_url(" not in text:
+        # [FIX-E] نشانه‌ی موتور نرمال‌شده یکی از این دو است: async_database_url()
+        # مستقیم، یا async_engine_kwargs_from_url() که خودش async_database_url را
+        # صدا می‌زند (app/core/database.py). media_worker/check_production/
+        # requeue_stale_media_jobs/enqueue_quality_matrix به شکل دوم مهاجرت
+        # کرده‌اند؛ پذیرش فقط نشانه‌ی اول false-FAIL می‌داد.
+        if "async_database_url(" not in text and "async_engine_kwargs_from_url(" not in text:
             fail(f"ASYNC_ENGINE_NOT_NORMALIZED:{path.relative_to(ROOT)}")
         if "postgresql+psycopg://" in text:
             fail(f"ASYNC_FILE_CONTAINS_PSYCOPG_URL:{path.relative_to(ROOT)}")
@@ -473,7 +478,7 @@ def check_migrations() -> None:
     """[P0-10] Dynamic instead of the hardcoded 0001..0016/0016-head range:
     scan alembic/versions/*.py for revision/down_revision pairs, assert the
     graph is a linear single-head chain whose head carries the max numeric
-    prefix (currently 0017_ads_system)."""
+    prefix (e.g. 0017_ads_system; a bare numeric id like 0018 also counts)."""
     global _MIGRATION_HEAD
     folder = ROOT / "alembic" / "versions"
     revisions: dict[str, str | None] = {}
@@ -485,7 +490,11 @@ def check_migrations() -> None:
             continue
         rev = match.group(1)
         revisions[rev] = None
-        num = re.match(r"(\d+)_", rev)
+        # [FIX-E] «0018_plan_duration_check» شناسه‌اش «0018» لخت است (بدون پسوند
+        # نام) — regex قبلی فقط «NNNN_name» را عددی می‌دانست و headِ واقعی به‌اشتباه
+        # MIGRATION_HEAD_NOT_MAX_NUMERIC می‌گرفت. عدد پیشوند برای هر دو شکل خوانده
+        # می‌شود؛ قدرت چک (head = جدیدترین عدد) تغییری نمی‌کند.
+        num = re.match(r"(\d+)(?:_|$)", rev)
         if num:
             numeric[rev] = int(num.group(1))
         down = re.search(r'^down_revision[^=]*=\s*(?:["\']([^"\']*)["\']|None)', text, re.M)

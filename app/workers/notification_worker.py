@@ -20,6 +20,12 @@ logger = logging.getLogger("femona.notification_worker")
 # Bounded batch: how many PENDING rows a single claim txn marks PROCESSING.
 CLAIM_BATCH_SIZE = 20
 
+# [FIX-E] سقف تلاش در claim: همان سقفِ retry در mark_notification_failed
+# (max_attempts=3). بدون «AND attempts < سقف» در CTE، چرخه‌ی «claim → کرش پس از
+# claim → recovery به PENDING → claim دوباره» attempts را از مسیر recovery
+# بی‌نهایت بالا می‌برد و سقف retry عملاً بلااستفاده می‌شد.
+_MAX_CLAIM_ATTEMPTS = 3
+
 # Delivery semantics: AT-LEAST-ONCE with a narrow duplicate window.
 #
 # Structure is collect-then-send:
@@ -36,6 +42,7 @@ CLAIM_BATCH_SIZE = 20
 #   * an ownership/status re-check (still PROCESSING + locked_by = us) right
 #     before every single send,
 #   * the per-job retry cap in mark_notification_failed (max_attempts=3),
+#     which the claim SQL now enforces too (attempts < 3 is not claimable),
 #   * the stale-PROCESSING recovery timeout (recover_stale_notifications).
 # Exactly-once delivery would require a Telegram-side idempotency key, which
 # the Bot API does not offer.
@@ -46,6 +53,7 @@ _CLAIM_BATCH_SQL = text(
         FROM notification_jobs
         WHERE status = 'PENDING'
           AND run_at <= CURRENT_TIMESTAMP
+          AND attempts < :max_attempts
         ORDER BY run_at ASC, created_at ASC
         FOR UPDATE SKIP LOCKED
         LIMIT :batch
@@ -142,7 +150,11 @@ async def run_notification_worker(*, poll_seconds: float = 1.0):
                         (
                             await session.execute(
                                 _CLAIM_BATCH_SQL,
-                                {"batch": CLAIM_BATCH_SIZE, "worker_id": worker_id},
+                                {
+                                    "batch": CLAIM_BATCH_SIZE,
+                                    "worker_id": worker_id,
+                                    "max_attempts": _MAX_CLAIM_ATTEMPTS,
+                                },
                             )
                         )
                         .mappings()

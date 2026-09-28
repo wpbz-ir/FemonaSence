@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
@@ -155,7 +156,7 @@ async def similar_titles(session, *, title_id, limit: int = 10) -> list[dict]:
                 JOIN title_genres tg2 ON tg2.genre_id = tg1.genre_id AND tg2.title_id <> tg1.title_id
                 JOIN titles t ON t.id = tg2.title_id
                 WHERE tg1.title_id = :tid
-                  AND t.status IN ('PUBLISHED', 'ACTIVE', 'PUBLIC')
+                  AND COALESCE(UPPER(t.status), '') IN ('PUBLISHED', 'ACTIVE', 'PUBLIC')
                 ORDER BY t.imdb_rating DESC NULLS LAST
                 LIMIT :lim
                 """
@@ -169,7 +170,12 @@ async def similar_titles(session, *, title_id, limit: int = 10) -> list[dict]:
 # ---------- امتیازدهی ----------
 
 async def record_rating(session, *, user_id, title_id, release_id, value: int) -> None:
-    """امتیاز کیفیت نسخه (۱=خوب، ۰=بد) در رخدادهای تحلیلی."""
+    """امتیاز کیفیت نسخه (۱=خوب، ۰=بد) در رخدادهای تحلیلی.
+
+    [FIX-E] دفاع لایه‌دوم در سرویس: مقدار قبل از ثبت کلمپ می‌شود تا payload
+    تحلیلی همیشه نرمال باشد — حتی اگر مسیرِ تازه‌ای بدون clamp صدا بزند.
+    """
+    value = max(0, min(1, int(value)))
     session.add(
         AnalyticsEvent(
             event_type="RATE_RELEASE",
@@ -249,8 +255,9 @@ async def link_referral(session, *, referred_user, code: str) -> dict:
     if ref_code.user_id == referred_user.id:
         return {"ok": False, "reason": None, "referrer_tg_id": None, "amount_irr": None}
     # فقط کاربر تازه‌وارد (کمتر از ۲۴ ساعت) قابل اتصال است — جلوگیری از سوءاستفاده
+    # [FIX-E] قرارداد «کمتر از ۲۴ ساعت» یعنی مرزِ ۲۴:۰۰:۰۰ هم رد می‌شود (>=، نه >)
     created_at = getattr(referred_user, "created_at", None)
-    if created_at and (datetime.now(timezone.utc) - created_at) > timedelta(hours=24):
+    if created_at and (datetime.now(timezone.utc) - created_at) >= timedelta(hours=24):
         return {"ok": False, "reason": None, "referrer_tg_id": None, "amount_irr": None}
     # [P1-11] قفل ردیف کاربرِ معرفی‌شده قبل از بررسی «قبلاً معرفی شده» — دو کلیک/
     # درخواست همزمان روی یک کاربر سری می‌شوند؛ تراکنش دوم پس از کامیت اولی، ردیف
@@ -330,28 +337,34 @@ _TEMPLATES = {
 
 
 async def ensure_notification_templates(session) -> int:
-    """قالب‌های اعلان را اگر نبودند می‌سازد (بذر خودکار)."""
+    """قالب‌های اعلان را اگر نبودند می‌سازد (بذر خودکار).
+
+    [FIX-E] check-then-insert بین دو نمونه‌ی هم‌زمان (ربات/ورکر نگهداری) روی
+    uq_notification_templates_code می‌ترکید و کل تراکنش نگهداری را abort می‌کرد؛
+    INSERT ... ON CONFLICT DO NOTHING اتمی است و rowcount=1 فقط برای برنده.
+    """
     created = 0
     for code, body in _TEMPLATES.items():
-        exists = await session.scalar(select(NotificationTemplate.id).where(NotificationTemplate.code == code))
-        if exists:
-            continue
-        session.add(
-            NotificationTemplate(
+        result = await session.execute(
+            pg_insert(NotificationTemplate)
+            .values(
                 code=code,
                 title=code,
                 body=body,
                 active=True,
             )
+            .on_conflict_do_nothing(constraint="uq_notification_templates_code")
         )
-        created += 1
-    if created:
-        await session.flush()
+        created += int(result.rowcount or 0)
     return created
 
 
 async def schedule_winback_jobs(session) -> int:
-    """برای اشتراک‌هایی که در ۴۸ ساعت گذشته منقضی شده‌اند، پیام بازگشت (وین‌بک) زمان‌بندی می‌کند."""
+    """برای اشتراک‌هایی که در ۴۸ ساعت گذشته منقضی شده‌اند، پیام بازگشت (وین‌بک) زمان‌بندی می‌کند.
+
+    [FIX-E] مثل ensure_notification_templates: check-then-insert روی
+    uq_notification_jobs_dedupe → INSERT ... ON CONFLICT DO NOTHING (اتمیک).
+    """
     rows = (
         await session.execute(
             text(
@@ -367,11 +380,9 @@ async def schedule_winback_jobs(session) -> int:
     created = 0
     for sub_id, user_id in rows:
         dedupe_key = f"subscription:{sub_id}:{WINBACK_CODE}"
-        exists = await session.scalar(select(NotificationJob.id).where(NotificationJob.dedupe_key == dedupe_key))
-        if exists:
-            continue
-        session.add(
-            NotificationJob(
+        result = await session.execute(
+            pg_insert(NotificationJob)
+            .values(
                 user_id=user_id,
                 subscription_id=sub_id,
                 notification_type=WINBACK_CODE,
@@ -379,8 +390,9 @@ async def schedule_winback_jobs(session) -> int:
                 run_at=datetime.now(timezone.utc),
                 status="PENDING",
             )
+            .on_conflict_do_nothing(constraint="uq_notification_jobs_dedupe")
         )
-        created += 1
+        created += int(result.rowcount or 0)
     return created
 
 
@@ -429,6 +441,7 @@ async def weekly_report_data(session) -> dict:
                     LEFT JOIN series se ON se.id = s.series_id
                     JOIN titles t ON t.id = COALESCE(r.title_id, se.title_id)
                     WHERE d.created_at > CURRENT_TIMESTAMP - INTERVAL '7 days' AND d.status='SUCCESS'
+                      AND COALESCE(UPPER(t.status), '') IN ('PUBLISHED', 'ACTIVE', 'PUBLIC')
                     GROUP BY t.id, name ORDER BY downloads DESC LIMIT 5
                     """
                 )

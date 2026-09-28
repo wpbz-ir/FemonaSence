@@ -240,7 +240,7 @@ docker run --name cinema-vault-redis -p 6379:6379 -d redis:8
 - `.env` هرگز وارد Git نشود.
 - Bot Token در گزارش، Screenshot یا GitHub قرار نگیرد.
 - فایل‌های اصلی رسانه در این فاز داخل پروژه قرار نگیرند.
-- `schema.sql` فقط برای بازرسی و مرجع است؛ تغییرات آینده باید با Alembic migration انجام شوند.
+- `schema.sql` فقط برای بازرسی (منسوخ؛ مرجع، مایگریشن‌های alembic است)؛ تغییرات آینده باید با Alembic migration انجام شوند.
 
 ## 13) بررسی نهایی فاز
 

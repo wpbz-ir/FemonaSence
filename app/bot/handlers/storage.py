@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from urllib.parse import urlparse
 
@@ -12,6 +13,8 @@ from app.services.storage_ingest import ingest_storage_message
 
 
 router = Router(name="storage")
+
+logger = logging.getLogger(__name__)
 
 
 _URL_RE = re.compile(r"^STREAM_URL\s*:\s*(https?://\S+)\s*$", re.I | re.M)
@@ -44,7 +47,10 @@ async def storage_channel_post(message: Message):
                 storage.extra_data = current
 
     if storage:
-        print(
-            f"STORAGE_INGESTED chat={message.chat.id} "
-            f"message={message.message_id} file_unique_id={storage.file_unique_key}"
+        # print() جایگزین شد — لاگ ساخت‌یافته با ماژول‌_logger (قابل فیلتر/جمع‌آوری)
+        logger.info(
+            "STORAGE_INGESTED chat=%s message=%s file_unique_id=%s",
+            message.chat.id,
+            message.message_id,
+            storage.file_unique_key,
         )

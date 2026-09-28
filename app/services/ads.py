@@ -143,7 +143,11 @@ async def set_ad_request_status(session, request_id, *, status: str, admin_note:
     if new_status not in AD_REQUEST_STATUSES:
         raise ValueError(f"invalid ad request status: {new_status!r}")
 
-    row = await session.get(AdRequest, request_id)
+    # [FIX-E] قفل ردیف هنگام خواندن: دو بررسی‌کننده‌ی هم‌زمان (ادمین ربات + پنل)
+    # هر دو همین GET را می‌زنند؛ بدون FOR UPDATE هر دو وضعیت فعلی را می‌بینند و
+    # اتصال‌پذیریِ وضعیت‌های پایانی (terminal immutability) می‌شکند. قفل ردیف،
+    # تراکنش دوم را تا کامیت اولی سری می‌کند و چک انتقال روی داده‌ی تازه انجام می‌شود.
+    row = await session.get(AdRequest, request_id, with_for_update=True)
     if row is None:
         return None
 

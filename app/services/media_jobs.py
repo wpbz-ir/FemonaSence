@@ -27,6 +27,12 @@ async def recover_stale_jobs(session, *, lease_seconds: int) -> int:
     total = 0
 
     # 1) Stale lease with attempts budget remaining -> back to the queue.
+    #    [FIX] available_at is delayed by lease_seconds, not immediate: an
+    #    immediate requeue let a second worker claim the same job_id and use
+    #    the SAME work_root/<job_id> directory while the original worker may
+    #    still have been reading/writing it. Reusing the lease window as the
+    #    cooldown guarantees the previous holder's lease is long dead before
+    #    anyone else can pick the row up.
     result = await session.execute(
         text(
             """
@@ -35,7 +41,7 @@ async def recover_stale_jobs(session, *, lease_seconds: int) -> int:
                 locked_by = NULL,
                 locked_at = NULL,
                 heartbeat_at = NULL,
-                available_at = CURRENT_TIMESTAMP,
+                available_at = CURRENT_TIMESTAMP + make_interval(secs => :lease_seconds),
                 updated_at = CURRENT_TIMESTAMP,
                 error_code = 'STALE_LEASE',
                 error_message = 'Worker lease expired; job returned to queue.'
