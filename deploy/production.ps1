@@ -35,18 +35,73 @@ $services = @(
     }
 )
 
-if ($env:TELEGRAM_MODE -eq "polling" -and $env:START_BOT -ne "0") {
+# --- Read .env so TELEGRAM_MODE / START_BOT set only in .env are honored ---
+# The app itself loads .env from the project root (services run with
+# WorkingDirectory = $Project), so read the same file here. Lines are KEY=VALUE;
+# comments (#) and blank lines are ignored; CRLF and optional quotes tolerated.
+# Shell environment variables always OVERRIDE .env values.
+$dotenvKeys = @{}
+$envFile = Join-Path $Project ".env"
+if (-not (Test-Path $envFile)) {
+    $envFile = Join-Path $PSScriptRoot ".env"
+}
+if (Test-Path $envFile) {
+    foreach ($line in Get-Content $envFile) {
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0 -or $trimmed.StartsWith("#") -or -not $trimmed.Contains("=")) { continue }
+        $eqIndex = $trimmed.IndexOf("=")
+        $key = $trimmed.Substring(0, $eqIndex).Trim()
+        $value = $trimmed.Substring($eqIndex + 1).Trim()
+        if ($value.Length -ge 2) {
+            if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+        if ($key.Length -gt 0) { $dotenvKeys[$key] = $value }
+    }
+}
+
+$effTelegramMode = $env:TELEGRAM_MODE
+if ([string]::IsNullOrWhiteSpace($effTelegramMode) -and $dotenvKeys.ContainsKey("TELEGRAM_MODE")) {
+    $effTelegramMode = $dotenvKeys["TELEGRAM_MODE"]
+}
+$effStartBot = $env:START_BOT
+if ([string]::IsNullOrWhiteSpace($effStartBot) -and $dotenvKeys.ContainsKey("START_BOT")) {
+    $effStartBot = $dotenvKeys["START_BOT"]
+}
+# Propagate the effective values so child processes match the gate decision.
+if (-not [string]::IsNullOrWhiteSpace($effTelegramMode)) { $env:TELEGRAM_MODE = $effTelegramMode }
+if (-not [string]::IsNullOrWhiteSpace($effStartBot)) { $env:START_BOT = $effStartBot }
+
+$telegramMode = ""
+if (-not [string]::IsNullOrWhiteSpace($effTelegramMode)) { $telegramMode = $effTelegramMode.Trim().ToLowerInvariant() }
+
+$botWillStart = $false
+if ($telegramMode -eq "polling") {
+    if ($effStartBot -eq "0") {
+        Write-Host "[BOT] Skipped: START_BOT=0" -ForegroundColor Yellow
+        Write-Host "BOT skipped (START_BOT=0) - panel and workers are starting without the Telegram bot." -ForegroundColor Yellow
+    } else {
+        $botWillStart = $true
+    }
+}
+elseif ($telegramMode -eq "webhook") {
+    Write-Host "[BOT] Skipped: TELEGRAM_MODE=webhook (start via API process)" -ForegroundColor Yellow
+}
+elseif ([string]::IsNullOrWhiteSpace($telegramMode)) {
+    Write-Host "[BOT] Skipped: TELEGRAM_MODE not set (set TELEGRAM_MODE=polling in .env to enable)" -ForegroundColor Yellow
+}
+else {
+    Write-Host "[BOT] Skipped: TELEGRAM_MODE=$telegramMode (not polling; set TELEGRAM_MODE=polling in .env to enable)" -ForegroundColor Yellow
+}
+
+if ($botWillStart) {
     $services += @{
         Name = "BOT"
         Args = @(".\main.py")
         Out = Join-Path $LogDir "bot.out.log"
         Err = Join-Path $LogDir "bot.err.log"
     }
-}
-elseif ($env:TELEGRAM_MODE -eq "polling" -and $env:START_BOT -eq "0") {
-    # Run without the bot (e.g. when api.telegram.org is unreachable):
-    #   $env:START_BOT = "0"  then run start_local.ps1 -- panel and workers start, bot is skipped.
-    Write-Host "BOT skipped (START_BOT=0) - panel and workers are starting without the Telegram bot." -ForegroundColor Yellow
 }
 
 foreach ($service in $services) {

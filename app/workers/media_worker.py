@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import shutil
 from pathlib import Path
 
@@ -36,6 +37,18 @@ from app.services.telegram_media import (
 
 
 logger = logging.getLogger("femona.media_worker")
+
+# Retry backoff bounds for the per-job lease heartbeat loop (see
+# _lease_heartbeat): retries stay fast enough to keep the lease alive while
+# still avoiding a hot retry storm against a struggling database.
+LEASE_HEARTBEAT_BACKOFF_BASE = 2.0
+LEASE_HEARTBEAT_BACKOFF_MAX = 30.0
+
+# Poll-loop crash guard bounds: when a poll iteration fails (DB blip,
+# transient network error), the worker logs the failure and retries after a
+# small jittered delay instead of letting the exception kill the process.
+POLL_ERROR_BACKOFF_MIN = 2.0
+POLL_ERROR_BACKOFF_MAX = 5.0
 
 
 def _db_url() -> str:
@@ -122,26 +135,39 @@ class MediaWorker:
 
         tasks: set[asyncio.Task] = set()
         while not self.stop_event.is_set():
-            while len(tasks) < self.settings.worker_concurrency and not self.stop_event.is_set():
-                async with self.sessions() as session:
-                    job = await claim_job(session, worker_id=self.settings.worker_id)
-                    await session.commit()
-                if job is None:
-                    break
-                task = asyncio.create_task(self._run_claimed(job))
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
+            try:
+                while len(tasks) < self.settings.worker_concurrency and not self.stop_event.is_set():
+                    async with self.sessions() as session:
+                        job = await claim_job(session, worker_id=self.settings.worker_id)
+                        await session.commit()
+                    if job is None:
+                        break
+                    task = asyncio.create_task(self._run_claimed(job))
+                    tasks.add(task)
+                    task.add_done_callback(tasks.discard)
 
-            async with self.sessions() as session:
-                await heartbeat(
-                    session,
-                    service_name="media_worker",
-                    metadata={
-                        "worker_id": self.settings.worker_id,
-                        "active_tasks": len(tasks),
-                    },
+                async with self.sessions() as session:
+                    await heartbeat(
+                        session,
+                        service_name="media_worker",
+                        metadata={
+                            "worker_id": self.settings.worker_id,
+                            "active_tasks": len(tasks),
+                        },
+                    )
+                    await session.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Per-iteration crash guard: one DB blip / transient error in
+                # claim or heartbeat must NOT kill the whole MEDIA process.
+                # Already-claimed jobs keep running as tasks (each guarded in
+                # _run_claimed); we just log, back off briefly and re-poll.
+                logger.exception("media worker poll iteration failed; retrying")
+                await asyncio.sleep(
+                    random.uniform(POLL_ERROR_BACKOFF_MIN, POLL_ERROR_BACKOFF_MAX)
                 )
-                await session.commit()
+                continue
 
             await asyncio.sleep(self.settings.poll_seconds)
 
@@ -182,8 +208,19 @@ class MediaWorker:
                     shutil.rmtree(self.settings.work_root / str(job["id"]), ignore_errors=True)
 
     async def _lease_heartbeat(self, job_id, stop: asyncio.Event):
-        try:
-            while not stop.is_set():
+        """Keep the RUNNING job's lease alive while the transcode runs.
+
+        Self-healing: this loop must NEVER exit on a transient DB blip. If it
+        died silently, the lease would expire while the transcode keeps going,
+        recover_stale_jobs() would hand the job to another worker, and the
+        same source would be transcoded twice. So every iteration catches
+        Exception, logs, backs off briefly and CONTINUES; the loop only exits
+        when the stop event is set or the task is cancelled (CancelledError
+        is re-raised so shutdown/cleanup still works).
+        """
+        backoff = LEASE_HEARTBEAT_BACKOFF_BASE
+        while not stop.is_set():
+            try:
                 await asyncio.sleep(self.settings.heartbeat_seconds)
                 if stop.is_set():
                     break
@@ -194,8 +231,17 @@ class MediaWorker:
                         worker_id=self.settings.worker_id,
                     )
                     await session.commit()
-        except asyncio.CancelledError:
-            raise
+                backoff = LEASE_HEARTBEAT_BACKOFF_BASE  # healthy beat: reset
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "lease heartbeat failed for job %s; retrying in %.1fs",
+                    job_id,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(LEASE_HEARTBEAT_BACKOFF_MAX, backoff * 2)
 
     async def process_job(self, job: dict):
         job_id = job["id"]
@@ -372,6 +418,34 @@ class MediaWorker:
 
         async with self.sessions() as session:
             if job.get("target_release_id"):
+                # Honor the advanced quality-matrix request: when the target
+                # Release carries technical_metadata.advanced_settings (set by
+                # build_quality_matrix's advanced flow), its target_container /
+                # target_codec_video / target_codec_audio describe the intended
+                # OUTPUT container/codec and must not be clobbered by the
+                # hardcoded 'MP4' / output-probe values below. Fall back to the
+                # probe-derived values (legacy behavior) when advanced_settings
+                # is absent. NOTE: the ffmpeg mux itself stays profile-driven
+                # (MP4/x264/AAC); a non-default target_container/codec is
+                # recorded here as the requested output metadata.
+                advanced_row = (
+                    await session.execute(
+                        text(
+                            "SELECT technical_metadata -> 'advanced_settings' AS advanced_settings "
+                            "FROM releases WHERE id = :release_id"
+                        ),
+                        {"release_id": job["target_release_id"]},
+                    )
+                ).mappings().first()
+                raw_advanced = advanced_row["advanced_settings"] if advanced_row else None
+                advanced = dict(raw_advanced) if isinstance(raw_advanced, dict) else {}
+                out_container = str(advanced.get("target_container") or "").strip() or "MP4"
+                out_codec_video = (
+                    str(advanced.get("target_codec_video") or "").strip()
+                    or (output_probe["video"].get("codec") or "h264")
+                )
+                out_codec_audio = str(advanced.get("target_codec_audio") or "").strip() or "aac"
+
                 await attach_storage_to_release(
                     session,
                     release_id=job["target_release_id"],
@@ -388,7 +462,7 @@ class MediaWorker:
                             size_bytes=:size_bytes,
                             codec_video=:codec_video,
                             codec_audio=:codec_audio,
-                            container='MP4',
+                            container=:container,
                             technical_metadata = COALESCE(technical_metadata, '{}'::jsonb) ||
                                 CAST(:metadata AS jsonb)
                         WHERE id=:release_id
@@ -399,8 +473,9 @@ class MediaWorker:
                         "width": output_probe["video"]["width"],
                         "height": output_probe["video"]["height"],
                         "size_bytes": output_path.stat().st_size,
-                        "codec_video": output_probe["video"].get("codec") or "h264",
-                        "codec_audio": "aac",
+                        "codec_video": out_codec_video,
+                        "codec_audio": out_codec_audio,
+                        "container": out_container,
                         "metadata": json.dumps(
                             {
                                 "media_hash_sha256": output_hash,

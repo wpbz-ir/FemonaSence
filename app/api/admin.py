@@ -8,17 +8,14 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import func, select, text
 
 from app.api.admin_auth import require_admin_token
 from app.core.config import settings
 from app.db.models import (
-    AdminActionLog,
     Collection,
     Episode,
-    Favorite,
     Genre,
-    MediaJob,
     Order,
     Payment,
     PaymentAttempt,
@@ -26,21 +23,16 @@ from app.db.models import (
     Plan,
     Release,
     ReleaseFile,
-    Role,
     Season,
     Series,
     ServiceHeartbeat,
     StorageFile,
-    Subscription,
     Title,
     User,
-    Wallet,
-    WatchHistory,
     Coupon,
     CouponRedemption,
     CouponTargetUser,
     NotificationTemplate,
-    user_roles,
 )
 
 from app.runtime.db import session_scope
@@ -58,7 +50,6 @@ from app.services.audit import record_admin_action
 from app.services.text_normalization import repair_mojibake
 from app.services.content_admin import (
     attach_storage_file,
-    create_collection,
     create_episode,
     create_episode_release,
     create_genre,
@@ -74,6 +65,7 @@ from app.services.content_admin import (
 )
 from app.services.content_pipeline import PipelineError, build_quality_matrix, sync_pipeline_run
 from app.services.heartbeats import service_instance_id
+from app.services.pricing import plan_toman_price
 from app.services.rate_limit import RateLimitExceeded, RateLimitUnavailable, enforce
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -157,6 +149,7 @@ class PlanCreate(BaseModel):
     price_irr: Decimal = Field(default=Decimal("0"), ge=0)
     duration_days: int = Field(ge=1, le=3650)
     rank: int = Field(default=0, ge=0, le=1000)
+    discount_percent: int = Field(default=0, ge=0, le=100)
     active: bool = True
     sort_order: int = 0
     features: dict = Field(default_factory=dict)
@@ -170,6 +163,7 @@ class PlanUpdate(BaseModel):
     price_irr: Decimal | None = Field(default=None, ge=0)
     duration_days: int | None = Field(default=None, ge=1, le=3650)
     rank: int | None = Field(default=None, ge=0, le=1000)
+    discount_percent: int | None = Field(default=None, ge=0, le=100)
     active: bool | None = None
     sort_order: int | None = None
     features: dict | None = None
@@ -638,11 +632,30 @@ async def plans():
             {
                 "id": str(x.id), "code": x.code, "name_fa": x.name_fa, "name_en": x.name_en,
                 "price_toman": str(x.price_toman or 0), "price_irr": str(x.price_irr or 0),
+                "discount_percent": float(x.discount_percent or 0),
+                "effective_price_toman": str(plan_toman_price(x)),
                 "duration_days": x.duration_days, "rank": x.rank, "active": x.active,
                 "sort_order": x.sort_order, "features": x.features,
             }
             for x in rows.all()
         ]
+
+
+@router.get("/plans/{plan_id}", dependencies=[Depends(admin_gate)])
+async def plan_detail(plan_id: uuid.UUID):
+    async with session_scope() as session:
+        x = await session.get(Plan, plan_id)
+        if x is None:
+            raise HTTPException(status_code=404, detail="پلن پیدا نشد.")
+        return {
+            "id": str(x.id), "code": x.code, "name_fa": x.name_fa, "name_en": x.name_en,
+            "description": x.description,
+            "price_toman": str(x.price_toman or 0), "price_irr": str(x.price_irr or 0),
+            "discount_percent": float(x.discount_percent or 0),
+            "effective_price_toman": str(plan_toman_price(x)),
+            "duration_days": x.duration_days, "rank": x.rank, "active": x.active,
+            "sort_order": x.sort_order, "features": x.features,
+        }
 
 
 @router.post("/plans", dependencies=[Depends(admin_gate)])
@@ -690,13 +703,6 @@ class PersonCreate(BaseModel):
     name_fa: str | None = None
 
 
-class CollectionCreate(BaseModel):
-    name_fa: str = Field(min_length=1, max_length=160)
-    name_en: str | None = None
-    description: str | None = None
-    parent_id: uuid.UUID | None = None
-
-
 class SeasonCreate(BaseModel):
     season_number: int = Field(ge=1, le=500)
     title: str | None = None
@@ -733,42 +739,11 @@ async def person_create(payload: PersonCreate, request: Request):
         return {"id": str(row.id), "slug": row.slug}
 
 
-@router.get("/collections", dependencies=[Depends(admin_gate)])
-async def collections_list():
-    async with session_scope() as session:
-        rows = await session.scalars(select(Collection).order_by(Collection.sort_order.asc(), Collection.name_fa.asc()).limit(200))
-        return [{"id": str(x.id), "fa": x.name_fa, "en": x.name_en, "slug": x.slug, "parent_id": str(x.parent_id) if x.parent_id else None} for x in rows.all()]
-
-
-@router.post("/collections", dependencies=[Depends(admin_gate)])
-async def collection_create(payload: CollectionCreate, request: Request):
-    async with session_scope() as session:
-        if payload.parent_id is not None:
-            parent = await session.get(Collection, payload.parent_id)
-            if parent is None:
-                raise HTTPException(status_code=404, detail="مجموعه والد پیدا نشد.")
-        row = await create_collection(session, **payload.model_dump())
-        await record_admin_action(session, action="CREATE_COLLECTION", entity_type="collection", entity_id=row.id, **_request_meta(request))
-        return {"id": str(row.id), "slug": row.slug}
-
-
-@router.get("/users", dependencies=[Depends(admin_gate)])
-async def users_list(offset: int = 0, limit: int = 50):
-    async with session_scope() as session:
-        rows = await session.scalars(
-            select(User).order_by(User.created_at.desc()).offset(max(offset, 0)).limit(max(1, min(limit, 100)))
-        )
-        return [
-            {
-                "id": str(x.id),
-                "telegram_user_id": x.telegram_user_id,
-                "username": x.username,
-                "name": " ".join(v for v in (x.first_name, x.last_name) if v) or None,
-                "status": x.status,
-                "last_seen_at": x.last_seen_at.isoformat() if x.last_seen_at else None,
-            }
-            for x in rows.all()
-        ]
+# [P0-5 route-dedup] GET/POST /collections, GET /users, GET /users/{id}/360,
+# PATCH /users/{id}/status (with main-admin self-block guard), GET /releases,
+# GET /payment-gateway (runtime config) and GET /audit are owned by
+# app/api/admin_extended.py — duplicates were removed from here so the extended
+# handlers are reachable (they were shadowed first-match-wins before).
 
 
 @router.get("/titles/{title_id}/seasons", dependencies=[Depends(admin_gate)])
@@ -912,102 +887,6 @@ async def upload_attach(payload: UploadAttach, request: Request):
         return {"release_id": str(release.id), "release_file_id": str(link.id), "status": release.status}
 
 
-@router.get("/users/{user_id}/360", dependencies=[Depends(admin_gate)])
-async def user_360(user_id: uuid.UUID):
-    async with session_scope() as session:
-        user = await session.get(User, user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="کاربر پیدا نشد.")
-        wallet = await session.scalar(select(Wallet).where(Wallet.user_id == user.id))
-        roles = await session.scalars(
-            select(Role.name).join(user_roles, user_roles.c.role_id == Role.id).where(user_roles.c.user_id == user.id)
-        )
-        subscriptions = (await session.execute(
-            select(Subscription, Plan.name_fa, Plan.code)
-            .join(Plan, Plan.id == Subscription.plan_id)
-            .where(Subscription.user_id == user.id)
-            .order_by(Subscription.expires_at.desc()).limit(20)
-        )).all()
-        orders = (await session.execute(
-            select(Order, Plan.name_fa).outerjoin(Plan, Plan.id == Order.plan_id)
-            .where(Order.user_id == user.id)
-            .order_by(Order.created_at.desc()).limit(30)
-        )).all()
-        favorites = await session.scalar(select(func.count()).select_from(Favorite).where(Favorite.user_id == user.id))
-        history = await session.scalar(select(func.count()).select_from(WatchHistory).where(WatchHistory.user_id == user.id))
-        return {
-            "user": {
-                "id": str(user.id), "telegram_user_id": user.telegram_user_id,
-                "username": user.username, "first_name": user.first_name, "last_name": user.last_name,
-                "language_code": user.language_code, "status": user.status,
-                "created_at": user.created_at.isoformat(),
-                "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
-            },
-            "roles": roles.all(),
-            "wallet_balance_irr": str(wallet.balance_irr if wallet else 0),
-            "favorites_count": int(favorites or 0), "watch_history_count": int(history or 0),
-            "subscriptions": [
-                {"id": str(x.id), "plan": name, "code": code, "status": x.status,
-                 "starts_at": x.starts_at.isoformat(), "expires_at": x.expires_at.isoformat()}
-                for x, name, code in subscriptions
-            ],
-            "orders": [
-                {"id": str(o.id), "order_number": o.order_number, "plan": name,
-                 "amount_toman": str(o.amount_toman or 0), "amount_irr": str(o.amount_irr),
-                 "status": o.status, "created_at": o.created_at.isoformat()}
-                for o, name in orders
-            ],
-        }
-
-
-class UserStatusUpdate(BaseModel):
-    status: str = Field(pattern="^(ACTIVE|BLOCKED|DISABLED)$")
-
-
-@router.patch("/users/{user_id}/status", dependencies=[Depends(admin_gate)])
-async def user_status_update(user_id: uuid.UUID, payload: UserStatusUpdate, request: Request):
-    async with session_scope() as session:
-        user = await session.get(User, user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="کاربر پیدا نشد.")
-        old = user.status
-        user.status = payload.status
-        await record_admin_action(
-            session, action="UPDATE_USER_STATUS", entity_type="user", entity_id=user.id,
-            details={"old": old, "new": payload.status}, **_request_meta(request)
-        )
-        return {"ok": True, "status": user.status}
-
-
-@router.get("/releases", dependencies=[Depends(admin_gate)])
-async def releases_list(title_id: uuid.UUID | None = None, episode_id: uuid.UUID | None = None, limit: int = 200):
-    async with session_scope() as session:
-        stmt = (select(Release, Episode.episode_number, Season.season_number)
-                .outerjoin(Episode, Release.episode_id == Episode.id)
-                .outerjoin(Season, Episode.season_id == Season.id))
-        if episode_id is not None:
-            stmt = stmt.where(Release.episode_id == episode_id)
-        elif title_id is not None:
-            title = await session.get(Title, title_id)
-            if title is None:
-                raise HTTPException(status_code=404, detail="عنوان پیدا نشد.")
-            if title.kind == "SERIES":
-                episode_ids = (select(Episode.id).join(Season, Episode.season_id == Season.id)
-                               .join(Series, Season.series_id == Series.id).where(Series.title_id == title_id))
-                stmt = stmt.where(or_(Release.title_id == title_id, Release.episode_id.in_(episode_ids)))
-            else:
-                stmt = stmt.where(Release.title_id == title_id)
-        rows = (await session.execute(stmt.order_by(Release.created_at.desc()).limit(min(max(1, limit), 300)))).all()
-        return [
-            {"id": str(r.id), "title_id": str(r.title_id) if r.title_id else None,
-             "episode_id": str(r.episode_id) if r.episode_id else None,
-             "season_number": season_no, "episode_number": episode_no,
-             "quality": r.quality, "language": r.language, "subtitle_type": r.subtitle_type,
-             "status": r.status, "label": r.label, "size_bytes": r.size_bytes}
-            for r, episode_no, season_no in rows
-        ]
-
-
 @router.get("/payments", dependencies=[Depends(admin_gate)])
 async def payments_list(provider: str | None = None, status: str | None = None, limit: int = 100):
     async with session_scope() as session:
@@ -1031,35 +910,6 @@ async def payments_list(provider: str | None = None, status: str | None = None, 
              "paid_at": payment.paid_at.isoformat() if payment and payment.paid_at else None,
              "provider_reference": payment.provider_reference if payment else None}
             for order, plan_name, attempt, payment in rows
-        ]
-
-
-@router.get("/payment-gateway", dependencies=[Depends(admin_gate)])
-async def payment_gateway():
-    return {
-        "winapay": {
-            "merchant_configured": bool(settings.winapay_merchant_id),
-            "sandbox": bool(settings.winapay_sandbox),
-            "base_url": settings.winapay_base_url,
-            "public_base_url_configured": bool(settings.public_base_url),
-            "callback_url": f"{settings.public_base_url}/payments/winapay/callback" if settings.public_base_url else None,
-            "note": "Secretها و Merchant ID واقعی از پنل برگردانده نمی‌شوند؛ شرایط پذیرندگی را با ارائه‌دهنده پرداخت تطبیق دهید.",
-        }
-    }
-
-
-@router.get("/audit", dependencies=[Depends(admin_gate)])
-async def audit(limit: int = 100):
-    async with session_scope() as session:
-        rows = await session.scalars(
-            select(AdminActionLog).order_by(AdminActionLog.created_at.desc()).limit(min(max(1, limit), 300))
-        )
-        return [
-            {"id": str(x.id), "created_at": x.created_at.isoformat(), "action": x.action,
-             "entity_type": x.entity_type, "entity_id": str(x.entity_id) if x.entity_id else None,
-             "method": x.method, "path": x.path, "success": x.success, "details": x.details,
-             "ip_address": x.ip_address, "actor_user_id": str(x.actor_user_id) if x.actor_user_id else None}
-            for x in rows.all()
         ]
 
 

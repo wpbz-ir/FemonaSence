@@ -4,6 +4,7 @@ from html import escape
 from uuid import UUID
 
 from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -406,8 +407,14 @@ async def search_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(SearchState.query, F.text)
 async def search_message(message: Message, state: FSMContext):
+    text = message.text or ""
+    if text.startswith("/"):
+        # دستور اسلش‌دار در حین جستجو نباید به‌عنوان متن جستجو بلعیده شود:
+        # state کهنه پاک می‌شود و رخداد به هندلرهای دستور روترهای بعدی واگذار می‌گردد.
+        await state.clear()
+        raise SkipHandler
     async with session_scope() as session:
-        items = await search_titles(session, message.text, limit=20)
+        items = await search_titles(session, text, limit=20)
     await state.clear()
     await message.answer(
         "<b>🔎 نتایج جستجو</b>\n\n" +
@@ -664,6 +671,11 @@ async def comment_cancel(callback: CallbackQuery, state: FSMContext):
 
 @router.message(CommentState.body, F.text)
 async def comment_message(message: Message, state: FSMContext):
+    if (message.text or "").startswith("/"):
+        # دستور اسلش‌دار در حین ثبت نظر نباید به‌عنوان متن نظر بلعیده شود:
+        # state کهنه پاک می‌شود و رخداد به هندلرهای دستور روترهای بعدی واگذار می‌گردد.
+        await state.clear()
+        raise SkipHandler
     data = await state.get_data()
     try:
         title_id = UUID(data["title_id"])

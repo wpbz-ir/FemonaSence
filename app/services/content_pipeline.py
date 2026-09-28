@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -28,6 +29,55 @@ DEFAULT_QUALITIES = ("480", "720", "1080")
 
 class PipelineError(ValueError):
     pass
+
+
+# Canonical defaults for the advanced matrix options (mirrors MatrixRequest in
+# app/api/admin_extended.py). Values are truncated to the DB column limits.
+_ADVANCED_DEFAULTS = {
+    "description": None,
+    "target_language": "ORIGINAL",
+    "target_subtitle_type": "NONE",
+    "target_codec_video": "H.264",
+    "target_codec_audio": "AAC",
+    "target_container": "MP4",
+    "auto_publish": False,
+}
+
+
+def _advanced_settings(
+    *,
+    description: str | None,
+    target_language: str,
+    target_subtitle_type: str,
+    target_codec_video: str,
+    target_codec_audio: str,
+    target_container: str,
+    auto_publish: bool,
+) -> dict:
+    """Normalize the advanced matrix options into comparable, storable values."""
+    return {
+        "description": ((description or "").strip()[:2000]) or None,
+        "target_language": ((target_language or "").strip()[:32]) or "ORIGINAL",
+        "target_subtitle_type": ((target_subtitle_type or "").strip()[:32]) or "NONE",
+        "target_codec_video": ((target_codec_video or "").strip()[:64]) or "H.264",
+        "target_codec_audio": ((target_codec_audio or "").strip()[:64]) or "AAC",
+        "target_container": ((target_container or "").strip()[:16]) or "MP4",
+        "auto_publish": bool(auto_publish),
+    }
+
+
+def _advanced_key(settings: dict) -> str:
+    """Stable signature of the advanced options that fork new runs/targets."""
+    return ":".join(
+        (
+            settings["target_language"],
+            settings["target_subtitle_type"],
+            settings["target_codec_video"],
+            settings["target_codec_audio"],
+            settings["target_container"],
+            "1" if settings["auto_publish"] else "0",
+        )
+    )
 
 
 async def _resolve_parent(session, source_release: Release) -> tuple[object, object, object]:
@@ -87,6 +137,13 @@ async def build_quality_matrix(
     requires_subscription: bool = False,
     minimum_plan_rank: int = 0,
     priority: int = 50,
+    description: str | None = None,
+    target_language: str = "ORIGINAL",
+    target_subtitle_type: str = "NONE",
+    target_codec_video: str = "H.264",
+    target_codec_audio: str = "AAC",
+    target_container: str = "MP4",
+    auto_publish: bool = False,
 ):
     source = await session.get(Release, source_release_id)
     if source is None:
@@ -113,7 +170,31 @@ async def build_quality_matrix(
     if not qualities:
         raise PipelineError(f"No requested quality is supported by the {source_height}p source.")
 
+    advanced = _advanced_settings(
+        description=description,
+        target_language=target_language,
+        target_subtitle_type=target_subtitle_type,
+        target_codec_video=target_codec_video,
+        target_codec_audio=target_codec_audio,
+        target_container=target_container,
+        auto_publish=auto_publish,
+    )
+    advanced_key = _advanced_key(advanced)
+    default_advanced_key = _advanced_key(_ADVANCED_DEFAULTS)
+    # Only non-default advanced options fork new dedupe/pipeline keys, so legacy
+    # callers (and existing DB rows) keep their original stable keys.
+    advanced_digest = (
+        ""
+        if advanced_key == default_advanced_key
+        else hashlib.sha256(advanced_key.encode("utf-8")).hexdigest()[:12]
+    )
+    # Persist the full advanced snapshot (including description) on created
+    # targets so nothing requested by the admin is lost.
+    advanced_payload = dict(advanced) if (advanced_digest or advanced["description"]) else None
+
     dedupe_key = f"{source.id}:{storage.id}:{','.join(qualities)}:{int(bool(requires_subscription))}:{int(minimum_plan_rank)}"
+    if advanced_digest:
+        dedupe_key = f"{dedupe_key}:{advanced_digest}"
     run = await session.scalar(
         select(ContentPipelineRun)
         .where(ContentPipelineRun.dedupe_key == dedupe_key)
@@ -155,6 +236,8 @@ async def build_quality_matrix(
             continue
 
         pipeline_key = f"matrix:{source.id}:{storage.id}:{quality}"
+        if advanced_digest:
+            pipeline_key = f"{pipeline_key}:{advanced_digest}"
         target = await session.scalar(
             select(Release).where(Release.pipeline_key == pipeline_key)
         )
@@ -165,9 +248,11 @@ async def build_quality_matrix(
                 quality=f"{quality}p",
                 width=None,
                 height=int(quality),
-                codec_video="H.264",
-                codec_audio="AAC",
-                container="MP4",
+                codec_video=advanced["target_codec_video"],
+                codec_audio=advanced["target_codec_audio"],
+                container=advanced["target_container"],
+                language=advanced["target_language"],
+                subtitle_type=advanced["target_subtitle_type"],
                 status="DRAFT",
                 source="PIPELINE",
                 priority=int(priority),
@@ -177,6 +262,11 @@ async def build_quality_matrix(
                     "source_release_id": str(source.id),
                     "source_storage_file_id": str(storage.id),
                     "target_quality": f"{quality}p",
+                    **(
+                        {"advanced_settings": dict(advanced_payload)}
+                        if advanced_payload
+                        else {}
+                    ),
                 },
             )
             target = Release(
@@ -225,6 +315,48 @@ async def build_quality_matrix(
     return run
 
 
+async def _auto_publish_ready_targets(session, run: ContentPipelineRun) -> int:
+    """Publish READY matrix targets whose run requested auto_publish=True.
+
+    The auto_publish intent is recorded on each created target release under
+    technical_metadata["advanced_settings"] when the run is built; this publish
+    step consumes it once every quality job of the run has succeeded. Safe to
+    re-run: only READY targets are flipped, so repeated syncs are no-ops.
+    """
+    if not run.items:
+        return 0
+
+    flagged = []
+    for item in run.items:
+        if item.target_release_id is None:
+            continue
+        target = await session.get(Release, item.target_release_id)
+        if target is None or target.status != "READY":
+            continue
+        advanced = (target.technical_metadata or {}).get("advanced_settings") or {}
+        if advanced.get("auto_publish"):
+            flagged.append(target)
+    if not flagged:
+        return 0
+
+    if settings.content_rights_required:
+        try:
+            source_release = await session.get(Release, run.source_release_id)
+            if source_release is None:
+                return 0
+            title_id, _, _ = await _resolve_parent(session, source_release)
+            title = await session.get(Title, title_id)
+        except PipelineError:
+            return 0
+        if title is None or not title.rights_verified:
+            return 0
+
+    for target in flagged:
+        target.status = "PUBLISHED"
+    await session.flush()
+    return len(flagged)
+
+
 async def sync_pipeline_run(session, run_id):
     run = await session.get(ContentPipelineRun, run_id, options=[selectinload(ContentPipelineRun.items)])
     if run is None:
@@ -261,6 +393,7 @@ async def sync_pipeline_run(session, run_id):
     if all(status == "SUCCEEDED" for status in statuses):
         run.status = "SUCCEEDED"
         run.finished_at = run.finished_at or datetime.now(timezone.utc)
+        await _auto_publish_ready_targets(session, run)
     elif any(status in {"FAILED", "CANCELLED"} for status in statuses):
         run.status = "FAILED"
         run.error_message = "One or more quality jobs failed."

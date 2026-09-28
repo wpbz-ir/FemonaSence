@@ -20,13 +20,19 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _discount_toman(amount: Decimal, discount_type: str, value: Decimal) -> Decimal:
+def _payable_toman(amount: Decimal, discount_type: str, value: Decimal) -> Decimal:
+    """Post-discount PAYABLE price in Toman (NOT the discount amount itself).
+
+    [P0-1] The discount actually granted is amount - payable:
+    PERCENT -> amount - discounted_amount(amount, pct); FIXED_TOMAN -> min(value, amount).
+    """
     if discount_type == "PERCENT":
         return discounted_amount(amount, value)
     return max(Decimal("0"), amount - value).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
 
 
-def _discount_stars(amount: int, value: Decimal) -> int:
+def _payable_stars(amount: int, value: Decimal) -> int:
+    """Post-discount PAYABLE price in Stars (NOT the discount amount itself)."""
     return int(discounted_amount(amount, value))
 
 
@@ -103,8 +109,18 @@ async def reserve_coupon(
 
     if coupon.discount_type == "FIXED_TOMAN" and amount_toman <= 0:
         raise ValueError("کد مبلغ ثابت فقط برای پرداخت تومانی قابل استفاده است.")
-    discount_toman = _discount_toman(amount_toman, coupon.discount_type, coupon.value) if amount_toman > 0 else Decimal("0")
-    discount_stars = _discount_stars(amount_stars, coupon.value) if coupon.discount_type == "PERCENT" and amount_stars > 0 else 0
+    # [P0-1] discount_toman/discount_stars are TRUE discount amounts (base - payable):
+    # PERCENT -> amount - discounted_amount(amount, pct); FIXED_TOMAN -> min(value, amount).
+    discount_toman = (
+        amount_toman - _payable_toman(amount_toman, coupon.discount_type, coupon.value)
+        if amount_toman > 0
+        else Decimal("0")
+    )
+    discount_stars = (
+        amount_stars - _payable_stars(amount_stars, coupon.value)
+        if coupon.discount_type == "PERCENT" and amount_stars > 0
+        else 0
+    )
     if coupon.discount_type == "FIXED_TOMAN" and amount_stars > 0:
         discount_stars = 0
 
@@ -163,6 +179,15 @@ async def preview_coupon(session, *, code: str, user_id: UUID, plan_id: UUID, am
         raise ValueError("اعتبار این کد تخفیف تمام شده است.")
     if not await _scope_ok(session, coupon, user_id=user_id, plan_id=plan_id):
         raise ValueError("این کد تخفیف برای این کاربر یا پلن قابل استفاده نیست.")
-    discount_toman = _discount_toman(amount_toman, coupon.discount_type, coupon.value) if amount_toman > 0 else Decimal("0")
-    discount_stars = _discount_stars(amount_stars, coupon.value) if coupon.discount_type == "PERCENT" and amount_stars > 0 else 0
+    # [P0-1] TRUE discount amounts (base - payable), same contract as reserve_coupon.
+    discount_toman = (
+        amount_toman - _payable_toman(amount_toman, coupon.discount_type, coupon.value)
+        if amount_toman > 0
+        else Decimal("0")
+    )
+    discount_stars = (
+        amount_stars - _payable_stars(amount_stars, coupon.value)
+        if coupon.discount_type == "PERCENT" and amount_stars > 0
+        else 0
+    )
     return {"code": coupon.code, "name_fa": coupon.name_fa, "discount_toman": discount_toman, "discount_stars": discount_stars, "discount_type": coupon.discount_type}

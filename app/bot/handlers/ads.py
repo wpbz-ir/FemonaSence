@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import html
 from uuid import UUID
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -10,8 +12,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.core.config import settings
 from app.runtime.db import session_scope
 from app.services.ads import (
-    ad_request_counts,
     create_ad_request,
+    get_ad_request,
     get_ad_settings,
     get_or_create_ad_settings,
     set_ad_request_status,
@@ -52,8 +54,7 @@ async def ads_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     async with session_scope() as session:
         row = await get_ad_settings(session)
-        active = bool(row and row.active)
-        counts = await ad_request_counts(session)
+    active = bool(row and row.active)
     if not active:
         await callback.message.edit_text(
             "<b>📣 تبلیغات</b>\n\nبخش تبلیغات در حال حاضر غیرفعال است.",
@@ -63,13 +64,13 @@ async def ads_menu(callback: CallbackQuery, state: FSMContext):
 
     lines = ["<b>📣 تبلیغات در فمونا سنس</b>", ""]
     if row and (row.rates_text or "").strip():
-        lines += ["💰 <b>تعرفه‌ها:</b>", f"<i>{row.rates_text.strip()}</i>", ""]
+        lines += ["💰 <b>تعرفه‌ها:</b>", f"<i>{html.escape(row.rates_text.strip())}</i>", ""]
     if row and (row.instructions_text or "").strip():
-        lines += ["📋 <b>راهنما:</b>", f"<i>{row.instructions_text.strip()}</i>", ""]
+        lines += ["📋 <b>راهنما:</b>", f"<i>{html.escape(row.instructions_text.strip())}</i>", ""]
     if row and (row.contact_text or "").strip():
-        lines += ["📞 <b>ارتباط با ما:</b>", f"<i>{row.contact_text.strip()}</i>", ""]
+        lines += ["📞 <b>ارتباط با ما:</b>", f"<i>{html.escape(row.contact_text.strip())}</i>", ""]
     if row and _channel_target(row):
-        lines.append(f"📢 کانال تبلیغات: {_channel_target(row)}")
+        lines.append(f"📢 کانال تبلیغات: {html.escape(_channel_target(row))}")
         lines.append("")
     lines.append("می‌توانید پست یا محتوای تبلیغ خود را ارسال کنید تا پس از تأیید، در کانال تبلیغات منتشر شود.")
     await callback.message.edit_text("\n".join(lines), reply_markup=_ads_back_keyboard())
@@ -78,6 +79,18 @@ async def ads_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "cv:ad:send")
 async def ads_send_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    # دکمه‌های قدیمی ممکن است بعد از غیرفعال‌سازی تبلیغات هنوز در دسترس باشند — دوباره بررسی می‌کنیم.
+    async with session_scope() as session:
+        setting = await get_ad_settings(session)
+    if not (setting and setting.active):
+        await state.clear()
+        await callback.message.edit_text(
+            "بخش تبلیغات در حال حاضر غیرفعال است.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")],
+            ]),
+        )
+        return
     await state.set_state(AdRequestState.waiting_content)
     await callback.message.edit_text(
         "<b>📨 ارسال محتوای تبلیغ</b>\n\n"
@@ -101,6 +114,33 @@ async def ads_send_cancel(callback: CallbackQuery, state: FSMContext):
     ))
 
 
+# --- رهگیر دستورها در حالت انتظار محتوای تبلیغ (جلوگیری از بلعیده‌شدن دستورهای اسلش‌دار توسط FSM) ---
+
+
+@router.message(AdRequestState.waiting_content, Command("cancel"))
+async def ads_state_cancel_command(message: Message, state: FSMContext):
+    """دستور /cancel در حین انتظار محتوای تبلیغ — پاک‌سازی state و لغو جریان."""
+    await state.clear()
+    await message.answer(
+        "ارسال تبلیغ لغو شد.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📣 بازگشت به تبلیغات", callback_data="menu:ads")],
+        ]),
+    )
+
+
+@router.message(AdRequestState.waiting_content, F.text.startswith("/"))
+async def ads_state_other_commands(message: Message, state: FSMContext):
+    """هر دستور دیگری در حین انتظار محتوا — state کهنه پاک می‌شود تا جریان عادی ربات آزاد شود."""
+    await state.clear()
+    await message.answer(
+        "حالت ارسال محتوای تبلیغ لغو شد؛ می‌توانید از منوی اصلی ادامه دهید.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")],
+        ]),
+    )
+
+
 @router.message(AdRequestState.waiting_content, F.text | F.photo | F.video | F.animation | F.document)
 async def ads_receive_content(message: Message, state: FSMContext):
     content_type = "TEXT"
@@ -115,19 +155,34 @@ async def ads_receive_content(message: Message, state: FSMContext):
         content_type, file_id = "DOCUMENT", message.document.file_id
     text_body = message.text or message.caption
 
+    ads_active = False
+    request = None
+    admin_ids: list[int] = []
     async with session_scope() as session:
-        user = await ensure_user(session, message.from_user)
-        request = await create_ad_request(
-            session,
-            user_id=user.id,
-            content_type=content_type,
-            content_text=text_body,
-            telegram_file_id=file_id,
-            source_chat_id=message.chat.id,
-            source_message_id=message.message_id,
-        )
-        admin_ids = await super_admin_telegram_ids(session)
+        setting = await get_ad_settings(session)
+        ads_active = bool(setting and setting.active)
+        if ads_active:
+            user = await ensure_user(session, message.from_user)
+            request = await create_ad_request(
+                session,
+                user_id=user.id,
+                content_type=content_type,
+                content_text=text_body,
+                telegram_file_id=file_id,
+                source_chat_id=message.chat.id,
+                source_message_id=message.message_id,
+            )
+            admin_ids = await super_admin_telegram_ids(session)
     await state.clear()
+
+    if not ads_active or request is None:
+        await message.answer(
+            "بخش تبلیغات در حال حاضر غیرفعال است؛ محتوای شما ثبت نشد.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")],
+            ]),
+        )
+        return
 
     await message.answer(
         "✅ درخواست تبلیغ شما با موفقیت ثبت شد.\n\n"
@@ -140,10 +195,10 @@ async def ads_receive_content(message: Message, state: FSMContext):
 
     # اطلاع‌رسانی به ادمین‌ها
     from_user = message.from_user
-    who = "@".join(filter(None, [from_user.username])) or from_user.first_name or str(from_user.id)
+    who = f"@{from_user.username}" if from_user.username else (from_user.first_name or str(from_user.id))
     admin_text = (
         "<b>📣 درخواست تبلیغ جدید</b>\n\n"
-        f"👤 کاربر: {who} (<code>{from_user.id}</code>)\n"
+        f"👤 کاربر: {html.escape(who)} (<code>{from_user.id}</code>)\n"
         f"🔖 نوع: {content_type}\n"
         f"🆔 درخواست: <code>{request.id}</code>"
     )
@@ -189,7 +244,11 @@ async def ads_approve(callback: CallbackQuery):
     if not await _require_admin(callback):
         await callback.answer("این عملیات فقط برای ادمین مجاز است.", show_alert=True)
         return
-    request_id = UUID(callback.data.split(":", 2)[2])
+    try:
+        request_id = UUID(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("شناسه درخواست نامعتبر است.", show_alert=True)
+        return
     async with session_scope() as session:
         row = await set_ad_request_status(
             session, request_id, status="APPROVED", admin_note=None,
@@ -208,7 +267,7 @@ async def ads_approve(callback: CallbackQuery):
     if callback.message:
         try:
             await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="📤 انتشار در کانال", callback_data=f"cv:ad:pub:{request.id}")]]
+                inline_keyboard=[[InlineKeyboardButton(text="📤 انتشار در کانال", callback_data=f"cv:ad:pub:{request_id}")]]
             ))
         except Exception:
             pass
@@ -219,7 +278,11 @@ async def ads_reject(callback: CallbackQuery):
     if not await _require_admin(callback):
         await callback.answer("این عملیات فقط برای ادمین مجاز است.", show_alert=True)
         return
-    request_id = UUID(callback.data.split(":", 2)[2])
+    try:
+        request_id = UUID(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("شناسه درخواست نامعتبر است.", show_alert=True)
+        return
     async with session_scope() as session:
         row = await set_ad_request_status(
             session, request_id, status="REJECTED", admin_note=None,
@@ -241,11 +304,24 @@ async def ads_publish(callback: CallbackQuery):
     if not await _require_admin(callback):
         await callback.answer("این عملیات فقط برای ادمین مجاز است.", show_alert=True)
         return
-    request_id = UUID(callback.data.split(":", 2)[2])
+    try:
+        request_id = UUID(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError, AttributeError):
+        await callback.answer("شناسه درخواست نامعتبر است.", show_alert=True)
+        return
     async with session_scope() as session:
         row = await get_ad_request(session, request_id)
         target = _channel_target(await get_or_create_ad_settings(session))
     if row is None or row.status == "REJECTED":
+        await callback.answer("این درخواست قابل انتشار نیست.", show_alert=True)
+        return
+    if row.status == "PENDING":
+        await callback.answer("ابتدا درخواست را تأیید کنید", show_alert=True)
+        return
+    if row.status == "PUBLISHED":
+        await callback.answer("این درخواست قبلاً منتشر شده است", show_alert=True)
+        return
+    if row.status != "APPROVED":
         await callback.answer("این درخواست قابل انتشار نیست.", show_alert=True)
         return
     if not target:
@@ -300,7 +376,7 @@ async def _publish_to_channel(bot, target: str, request_id) -> bool:
             sent = None
     if sent is None and content_type == "TEXT":
         try:
-            sent = await bot.send_message(target, content_text)
+            sent = await bot.send_message(target, html.escape(content_text))
         except Exception:
             sent = None
     if sent is None:

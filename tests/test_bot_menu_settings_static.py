@@ -16,12 +16,16 @@ def test_bot_menu_config_preserves_callback_contracts():
     assert required.issubset(callbacks)
 
 
-def test_admin_html_has_bot_menu_panel_and_endpoint():
+def test_admin_html_has_bot_menu_section_and_endpoint():
+    # [P0-10] The old bot-menu SETTINGS panel (botMenuSettings/saveBotMenuSettings)
+    # was removed from admin.html; the current "منوی ربات" section is a read-only
+    # view fed by GET /bot-menu (app/api/admin.py, backed by the bot keyboard).
     html = read("app/api/templates/admin.html")
-    assert 'data-panel="bot-menu"' in html
-    assert 'id="botMenuSettings"' in html
-    assert 'saveBotMenuSettings' in html
-    assert "'/settings/bot-menu'" in html
+    assert "'bot-menu':'منوی ربات'" in html  # page label registered in PAGES
+    assert "api('/bot-menu')" in html  # section fetches the endpoint
+    admin = read("app/api/admin.py")
+    assert '@router.get("/bot-menu", dependencies=[Depends(admin_gate)])' in admin
+    assert "MAIN_MENU_ITEMS" in admin  # served from the bot keyboard source
 
 
 def test_granular_settings_exist():

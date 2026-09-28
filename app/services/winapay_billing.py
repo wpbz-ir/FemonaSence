@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import secrets
@@ -57,6 +58,8 @@ async def create_winapay_subscription_order(session, *, user_id, plan: Plan, cou
             session, code=coupon_code, user_id=user_id, plan_id=plan.id, order_id=order.id,
             amount_toman=base_price, amount_stars=0,
         )
+        # [P0-1] discount_toman is the TRUE discount amount (base - payable), so
+        # base - discount is the payable price; the >= 100 Toman floor stays.
         price = base_price - Decimal(preview["discount_toman"] or 0)
         if price < 100:
             await release_coupon_for_order(session, order_id=order.id)
@@ -142,7 +145,10 @@ async def prepare_winapay_payment(session, *, order: Order, attempt: PaymentAtte
     attempt.payment_url = result.payment_url
     attempt.status = "PENDING"
     attempt.requested_amount_toman = amount
-    attempt.raw_callback = {"request": result.__dict__ if hasattr(result, "__dict__") else {}}
+    # [P0-8] PaymentStartResult is frozen+slots=True -> instances have NO __dict__
+    # (hasattr() was always False, so raw_callback persisted {}). asdict() reads
+    # dataclass fields() and yields a JSON-safe dict for the jsonb column.
+    attempt.raw_callback = {"request": dataclasses.asdict(result)}
     await session.flush()
     return result.payment_url
 

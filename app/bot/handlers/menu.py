@@ -14,8 +14,11 @@ router = Router(name="menu")
 
 
 @router.callback_query(F.data == "menu:home")
-async def home_callback(callback: CallbackQuery):
+async def home_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    # بازگشت به خانه هر وضعیت FSM کهنه (جستجو/نظر/تبلیغ/کد تخفیف) را پاک می‌کند
+    # تا پیام‌های بعدی به هندلرهای اشتباه نروند.
+    await state.clear()
     if not callback.message:
         return
 
@@ -57,11 +60,5 @@ async def wallet_redirect(callback: CallbackQuery):
 async def admin_redirect(callback: CallbackQuery):
     from app.bot.handlers.admin import send_admin
     await send_admin(callback)
-
-
-@router.callback_query(F.data == "menu:ads")
-async def ads_redirect(callback: CallbackQuery, state: FSMContext = None):
-    from app.bot.handlers.ads import ads_menu
-    await ads_menu(callback, state)
 
 

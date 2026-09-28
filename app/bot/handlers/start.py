@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import html
 from uuid import UUID
 
 from aiogram import Router
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.bot.keyboards.main_menu import main_menu_keyboard
@@ -30,7 +32,10 @@ HELP_TEXT = (
 
 
 @router.message(Command("help"))
-async def help_handler(message: Message):
+async def help_handler(message: Message, state: FSMContext):
+    # /help هم باید وضعیت FSM کهنه را پاک کند؛ وگرنه کاربر بعد از دیدن راهنما
+    # همچنان در حالت جستجو/نظر گیر می‌ماند.
+    await state.clear()
     await message.answer(HELP_TEXT, reply_markup=main_menu_keyboard())
 
 
@@ -38,7 +43,10 @@ async def help_handler(message: Message):
 
 
 @router.message(CommandStart())
-async def start_handler(message: Message):
+async def start_handler(message: Message, state: FSMContext):
+    # /start همیشه وضعیت FSM کهنه (SearchState/CommentState/AdRequestState/...) را پاک
+    # می‌کند تا پیام‌های بعدی به هندلرهای حالت اشتباه نروند.
+    await state.clear()
     payload = ""
     if message.text:
         parts = message.text.split(maxsplit=1)
@@ -63,6 +71,9 @@ async def start_handler(message: Message):
 
     if shared_title:
         name = shared_title.title_fa or shared_title.title_en or shared_title.original_title or "عنوان"
+        # bot default parse_mode=HTML است (session.py)؛ نام عنوان از پنل/پایپ‌لاین می‌آید و
+        # اگر تگ HTML داشته باشد، کپشن/متن اشتراک‌گذاری می‌شکند یا تزریق می‌شود.
+        name = html.escape(name, quote=False)
         buttons = [[InlineKeyboardButton(text="🎬 مشاهده صفحه عنوان", callback_data=f"cv:title:{shared_title.id}")], [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")]]
         if getattr(shared_title, "poster_url", None):
             try:

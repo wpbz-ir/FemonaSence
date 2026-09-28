@@ -10,24 +10,60 @@ class AdminEnhancementsStaticTests(unittest.TestCase):
         ast.parse((ROOT / "app/api/admin_extended.py").read_text(encoding="utf-8"))
 
     def test_main_registers_extended_router(self):
+        # [P0-10] admin_extended is imported via `from app.api import admin_extended`
+        # (it decorates the shared admin router; there is no literal
+        # "import app.api.admin_extended" any more) and the panel HTML is served
+        # from app/api/templates/admin.html at /admin (plus /api/admin/ui).
         text = (ROOT / "app/api/main.py").read_text(encoding="utf-8")
-        self.assertIn("import app.api.admin_extended", text)
-        self.assertIn('/admin/static', text)
+        self.assertIn("from app.api import admin_extended", text)
+        self.assertIn('"templates" / "admin.html"', text)
+        self.assertIn('@app.get("/admin"', text)
 
-    def test_admin_ui_is_persian_and_local_font_ready(self):
-        text = (ROOT / "app/api/templates/admin.html").read_text(encoding="utf-8")
+    def test_admin_ui_is_persian_and_cdn_font_ready(self):
+        # [P0-10] Vazirmatn is now loaded from the Google Fonts CDN; the local
+        # @font-face/woff2 statics were removed. Keep the protective intent:
+        # the CDN reference must exist and no local font URL may 404.
+        from html.parser import HTMLParser
+
+        class _VisibleText(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.skip = 0
+                self.parts = []
+
+            def handle_starttag(self, tag, attrs):
+                if tag.lower() in {"script", "style", "noscript"}:
+                    self.skip += 1
+
+            def handle_endtag(self, tag):
+                if tag.lower() in {"script", "style", "noscript"} and self.skip:
+                    self.skip -= 1
+
+            def handle_data(self, data):
+                if not self.skip:
+                    self.parts.append(data)
+
+        raw = (ROOT / "app/api/templates/admin.html").read_text(encoding="utf-8")
+        parser = _VisibleText()
+        parser.feed(raw)
+        text = " ".join(parser.parts)
+        # Mojibake must not be VISIBLE; the panel's own JS mojibake detector
+        # intentionally lists the bad characters inside <script>, so only the
+        # visible text is asserted here.
         self.assertNotIn("Ø", text)
         self.assertNotIn("Ù", text)
-        self.assertIn("Vazirmatn-Regular.woff2", text)
-        self.assertIn("Vazirmatn-Bold.woff2", text)
-        self.assertIn("font-family:Vazirmatn,sans-serif", text)
-        self.assertIn("پروفایل ۳۶۰", text)
-        self.assertIn("درگاه پرداخت", text)
-        self.assertIn("ساخت ماتریس", text)
-        self.assertIn("کُدگذاری", text)
-        self.assertIn("تنظیمات منوی ربات", text)
-        self.assertNotIn("تنظیمات این بخش مستقل از تنظیمات Bot", text)
-        self.assertNotIn("شناسه‌های فنی callback", text)
+        self.assertIn("https://fonts.googleapis.com", raw)
+        self.assertIn("family=Vazirmatn", raw)
+        self.assertIn("font-family:Vazirmatn", raw)
+        for stale in ("@font-face", "/admin/static/fonts/", "woff2"):
+            self.assertNotIn(stale, raw)
+        self.assertIn("نمای ۳۶۰", raw)
+        self.assertIn("درگاه پرداخت", raw)
+        self.assertIn("ساخت پردازش کیفیت", raw)
+        self.assertIn("کدگذاری", raw)
+        self.assertIn("منوی ربات", raw)
+        self.assertNotIn("تنظیمات این بخش مستقل از تنظیمات Bot", raw)
+        self.assertNotIn("شناسه‌های فنی callback", raw)
 
     def test_payment_and_pricing_services_parse(self):
         for name in [

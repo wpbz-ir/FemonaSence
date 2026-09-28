@@ -5,6 +5,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Message, PreCheckoutQuery
@@ -136,13 +137,19 @@ async def coupon_clear(callback: CallbackQuery, state: FSMContext):
     await show_plans(callback, state)
 
 
-@router.message(CouponState.code)
+@router.message(CouponState.code, F.text)
 async def coupon_message(message: Message, state: FSMContext):
-    if (message.text or "").strip() == "/cancel":
+    text = (message.text or "").strip()
+    if text == "/cancel":
         await state.clear()
         await message.answer("لغو شد.")
         await show_plans(message, state)
         return
+    if text.startswith("/"):
+        # دستور اسلش‌دار در حین وارد کردن کد تخفیف نباید به‌عنوان کد بلعیده شود:
+        # وضعیت کهنه پاک و رخداد به هندلرهای دستور روترهای بعدی واگذار می‌شود.
+        await state.clear()
+        raise SkipHandler
     code = normalize_coupon_code(message.text or "")
     if not code:
         await message.answer("کد تخفیف معتبر نیست. دوباره ارسال کنید.")

@@ -45,6 +45,8 @@ async def create_star_order(session, *, user_id, plan: Plan, coupon_code: str | 
             session, code=coupon_code, user_id=user_id, plan_id=plan.id,
             order_id=order.id, amount_toman=Decimal("0"), amount_stars=stars,
         )
+        # [P0-1] discount_stars is the TRUE discount amount (base - payable), so
+        # subtracting it yields the payable price; floor of 1 star is intentional.
         discount_stars = int(preview["discount_stars"] or 0)
         stars = max(1, stars - discount_stars)
         order.amount_irr = Decimal(stars)

@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from aiogram import Bot
+from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand
 
 from app.bot.app import create_bot
+from app.bot.session import make_bot
 from app.core.config import settings, validate_settings
 from app.core.logging import configure_logging
 from app.workers.maintenance import maintenance_loop
@@ -69,6 +70,31 @@ async def _supervised(name: str, factory) -> None:
             await asyncio.sleep(5)
 
 
+async def run_polling(dp: Dispatcher) -> None:
+    """هر تلاشِ polling: باتِ تازه + ثبت دستورات + start_polling.
+
+    نکته‌ی مهم: در aiogram 3.x پیش‌فرض start_polling نشست بات را می‌بندد
+    (close_bot_session=True)؛ در آن صورت پس از اولین خروج، همه‌ی تلاش‌های
+    بعدی با نشستِ بسته شکست می‌خورند و حلقه‌ی بازیابی می‌میرد. برای همین:
+    ۱) هر تلاش با make_bot() باتِ تازه می‌سازد (نشست قبلیِ بسته هرگز به
+       start_polling نمی‌رسد)؛
+    ۲) close_bot_session=False تا aiogram نشستِ باتِ جاری را نبندد و
+       بسته‌شدن نشست را خودِ همین تابع در finally انجام می‌دهد.
+    """
+    bot = make_bot()
+    try:
+        # دیسپچر باید به باتِ تازه‌ی همین تلاش اشاره کند تا reference کهنه
+        # (باتی با نشست بسته) در workflow data باقی نماند.
+        dp.workflow_data["bot"] = bot
+        # ثبت دستورات غیرمرگبار است (۳ بار تلاش و بعد ادامه) - در هر تلاش تکرار می‌شود
+        await setup_commands(bot)
+        await dp.start_polling(bot, close_bot_session=False)
+    finally:
+        # نشستِ باتِ همین تلاش را خودمان می‌بندیم تا نشت session رخ ندهد؛
+        # تلاش بعدی (بعد از backoff در _supervised) باتِ تازه می‌سازد.
+        await bot.session.close()
+
+
 async def main() -> None:
     configure_logging()
     validate_settings(strict=settings.app_env == "production")
@@ -89,7 +115,9 @@ async def main() -> None:
         print("======================================")
 
         # polling هم supervision شده تا قطعی شبکه کل ربات را نکشد
-        tasks = [_supervised("polling", lambda: dp.start_polling(bot))]
+        # هر تلاش polling باتِ تازه می‌سازد (run_polling) تا نشستِ بسته‌شده
+        # باعث شکست همیشگی تلاش‌های بعدی نشود.
+        tasks = [_supervised("polling", lambda: run_polling(dp))]
         if settings.run_maintenance_in_bot:
             tasks.append(
                 _supervised(

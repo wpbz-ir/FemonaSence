@@ -17,4 +17,4 @@ Get-CimInstance Win32_Process |
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
 
-Write-Host "فمونا سنس production processes stopped." -ForegroundColor Yellow
+Write-Host "FemonaSense / CinemaVault production processes stopped." -ForegroundColor Yellow

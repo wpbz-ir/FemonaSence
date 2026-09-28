@@ -169,9 +169,13 @@ async def health_ready():
             from app.bot.session import make_bot
 
             bot = make_bot()
-            me = await bot.get_me()
-            bot_ok = bool(me.id)
-            await bot.session.close()
+            # [G04-e LK-1] close the per-probe session even when get_me fails
+            # (Telegram down), otherwise every cache miss leaks a ClientSession.
+            try:
+                me = await bot.get_me()
+                bot_ok = bool(me.id)
+            finally:
+                await bot.session.close()
         except Exception:
             bot_ok = False
 

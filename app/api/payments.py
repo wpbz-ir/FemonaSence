@@ -53,12 +53,23 @@ async def start_winapay_payment(token: str):
         if attempt.payment_url and attempt.status == "PENDING":
             url = attempt.payment_url
         else:
-            url = await prepare_winapay_payment(
-                session,
-                order=order,
-                attempt=attempt,
-                callback_url=callback,
-            )
+            # [P0-8] Provider prepare errors must never surface as an unhandled 500:
+            # persist the PaymentAttempt as FAILED, then answer 502 with a Persian message.
+            try:
+                url = await prepare_winapay_payment(
+                    session,
+                    order=order,
+                    attempt=attempt,
+                    callback_url=callback,
+                )
+            except Exception as exc:
+                attempt.status = "FAILED"
+                attempt.error_message = (str(exc) or exc.__class__.__name__)[:4000]
+                await session.commit()
+                raise HTTPException(
+                    status_code=502,
+                    detail="خطا در ارتباط با درگاه پرداخت ویناپی. لطفاً چند لحظه دیگر دوباره تلاش کنید.",
+                ) from exc
         order.status = "PENDING"
         await session.commit()
     return RedirectResponse(url, status_code=303)
@@ -123,6 +134,20 @@ async def winapay_callback(request: Request):
                 callback_payload=payload,
             )
         except Exception as exc:
+            # [P0-8] Provider verify errors: persist the PaymentAttempt as FAILED,
+            # mark the webhook event FAILED, then answer 502 so the gateway retries
+            # (webhook event dedup keeps retries idempotent).
+            failed_attempt = await session.scalar(
+                select(PaymentAttempt)
+                .where(
+                    PaymentAttempt.order_id == order.id,
+                    PaymentAttempt.provider == "WINAPAY",
+                )
+                .order_by(PaymentAttempt.created_at.desc())
+            )
+            if failed_attempt is not None:
+                failed_attempt.status = "FAILED"
+                failed_attempt.error_message = (str(exc) or exc.__class__.__name__)[:4000]
             if event_id:
                 await session.execute(
                     text(
@@ -131,7 +156,10 @@ async def winapay_callback(request: Request):
                     {"id": event_id, "error": str(exc)[:4000]},
                 )
             await session.commit()
-            return _payment_page("❌", "تأیید پرداخت انجام نشد. اطلاعات سفارش ذخیره شده و نیاز به بررسی دارد.")
+            raise HTTPException(
+                status_code=502,
+                detail="خطا در تأیید پرداخت با درگاه ویناپی. اطلاعات ثبت شده است و پس از تلاش مجدد درگاه بررسی خواهد شد.",
+            ) from exc
 
         if event_id:
             await session.execute(

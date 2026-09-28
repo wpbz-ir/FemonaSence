@@ -48,7 +48,7 @@ Telegram Bot API رسمی فعلاً برای `getFile` سقف دانلود 20MB
 - health live/readiness.
 - heartbeat.
 - audit logs.
-- Backup/Restore دیتابیس از طریق کنسول رسمی Neon انجام می‌شود؛ اسکریپت `pg_dump`/`pg_restore` عمداً در بسته نهایی وجود ندارد.
+- Backup/Restore دستی دیتابیس از طریق کنسول رسمی Neon انجام می‌شود. علاوه بر آن، بک‌آپ خودکار روزانه `pg_dump` در خود پروژه وجود دارد: با `AUTO_BACKUP_ENABLED=1` و `AUTO_BACKUP_CHAT_ID`، Worker نگهداری هر روز در ساعت `AUTO_BACKUP_HOUR` یک `pg_dump` (فرمت custom) می‌گیرد و فایل را به کانال تلگرامی ارسال می‌کند؛ `pg_dump` باید روی سرور نصب باشد (در غیر این صورت بک‌آپ آن روز رد می‌شود و فقط هشدار ثبت می‌شود).
 - Windows Scheduled Tasks برای Web / Runtime / Media.
 - Static Audit نهایی.
 
@@ -102,7 +102,7 @@ cd C:\CinemaVault
 python -m alembic upgrade head
 python -m alembic current
 ```
-باید head نهایی `0015_production_state` باشد.
+باید head نهایی `0017_ads_system` باشد.
 
 ### 5. Redis
 برای Redis محلی:
@@ -155,6 +155,20 @@ cd C:\CinemaVault
 powershell -ExecutionPolicy Bypass -File .\deploy\register_tasks.ps1
 ```
 
+#### کنترل Bot با `TELEGRAM_MODE` و `START_BOT`
+
+`production.ps1` مقدار `TELEGRAM_MODE` و `START_BOT` را از فایل `.env` ریشه پروژه می‌خواند (اگر `.env` کنار خود اسکریپت هم باشد استفاده می‌شود)؛ متغیرهایی که قبل از اجرا در Shell تنظیم شده باشند بر `.env` اولویت دارند. رفتار:
+
+- `TELEGRAM_MODE=polling` (پیش‌فرض): پروسه Bot به‌صورت جداگانه اجرا می‌شود و PID آن چاپ می‌شود.
+- `TELEGRAM_MODE=webhook`: پروسه Bot جداگانه اجرا **نمی‌شود**؛ آپدیت‌ها از مسیر Webhook به پروسه API می‌رسند. اسکریپت این را صریحاً چاپ می‌کند:
+  `[BOT] Skipped: TELEGRAM_MODE=webhook (start via API process)`
+- `START_BOT=0`: پروسه Bot اجرا نمی‌شود و پنل + Workerها بدون Bot بالا می‌آیند (مثلاً وقتی `api.telegram.org` در دسترس نیست):
+  `[BOT] Skipped: START_BOT=0`
+- اگر `TELEGRAM_MODE` نه در Shell و نه در `.env` تنظیم نشده باشد:
+  `[BOT] Skipped: TELEGRAM_MODE not set (set TELEGRAM_MODE=polling in .env to enable)`
+
+خروج شدن Bot با خطا غیرحیاتی (non-fatal) است؛ پنل و Workerها آنلاین می‌مانند و اسکریپت `WINDOWS_PROCESS_STARTUP_OK (BOT failed - panel is online, see hints above)` چاپ می‌کند. برای دیدن `TELEGRAM_MODE` و `START_BOT` پیشنهادی به `.env.example` ریشه پروژه مراجعه کنید.
+
 ### 11. بررسی
 ```powershell
 curl https://YOUR-DOMAIN.example/health/live
@@ -162,9 +176,15 @@ curl https://YOUR-DOMAIN.example/health/ready
 ```
 
 ### 12. Backup / Restore دیتابیس
-Backup و Restore دیتابیس را از داخل **console.neon.tech** انجام دهید.
 
-پروژه عمداً هیچ `pg_dump`/`pg_restore` محلی را در مسیر عملیاتی خود نگه نمی‌دارد تا فرآیند Backup/Restore پایگاه‌داده از سورس برنامه جدا بماند.
+**بک‌آپ خودکار روزانه (داخل پروژه):** با تنظیم `AUTO_BACKUP_ENABLED=1` و `AUTO_BACKUP_CHAT_ID`، Worker نگهداری هر روز در ساعت `AUTO_BACKUP_HOUR` (پیش‌فرض 3) یک `pg_dump` با فرمت custom (فایل `.dump`) می‌گیرد و آن را به کانال تلگرامی ارسال می‌کند. `pg_dump` باید روی سرور نصب و در `PATH` باشد؛ در غیر این صورت بک‌آپ آن روز انجام نمی‌شود و فقط هشدار ثبت می‌شود (سرویس‌ها متوقف نمی‌شوند).
+
+**Restore:** فایل `.dump` را با `pg_restore` بازگردانید:
+```powershell
+pg_restore -h HOST -p PORT -U USER -d DB --clean --if-exists backup.dump
+```
+
+**بک‌آپ/بازگردانی دستی:** علاوه بر مسیر خودکار بالا، می‌توانید از کنسول رسمی **console.neon.tech** نیز استفاده کنید. توصیه می‌شود کنسول را به‌عنوان مسیر دستی نگه دارید تا عملیات Backup/Restore دستی از سورس برنامه جدا بماند؛ مسیر خودکار `pg_dump` مکمل آن برای بک‌آپ روزانه است.
 
 ## مسیر عملی افزودن Media
 
