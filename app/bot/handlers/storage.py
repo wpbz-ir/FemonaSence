@@ -31,20 +31,56 @@ def _safe_stream_url(caption: str | None) -> str | None:
     return value[:2048]
 
 
+def _media_kind(message: Message) -> str:
+    if message.video:
+        return "video"
+    if message.document:
+        return f"document:{message.document.mime_type or 'unknown'}"
+    if message.photo:
+        return "photo"
+    if message.video_note:
+        return "video_note"
+    if message.animation:
+        return "animation"
+    return "none"
+
+
 @router.channel_post()
 async def storage_channel_post(message: Message):
-    if settings.production_storage_chat_id is not None and message.chat.id != settings.production_storage_chat_id:
+    configured = settings.production_storage_chat_id
+    if configured is not None and message.chat.id != configured:
+        # [DIAG] قبلاً ناسازگاریِ شناسه کانال «بی‌صدا» رد می‌شد و عیب‌یابیِ
+        # «چرا فایل من در پنل نیست» غیرممکن بود. حالا هر پستِ نادیده‌گرفته با
+        # شناسه‌ی واقعی کانال ثبت می‌شود تا مقدار .env بر همین اساس اصلاح شود.
+        logger.warning(
+            "CHANNEL_POST_IGNORED chat=%s title=%r media=%s (configured storage chat=%s) — "
+            "if this is your storage channel, set TELEGRAM_STORAGE_CHAT_ID to exactly this chat id",
+            message.chat.id,
+            message.chat.title,
+            _media_kind(message),
+            configured,
+        )
         return
 
     async with session_scope() as session:
         storage = await ingest_storage_message(session, message)
-        if storage:
-            stream_url = _safe_stream_url(message.caption or message.text)
-            if stream_url:
-                current = storage.extra_data or {}
-                current["stream_url"] = stream_url
-                current["stream_url_source"] = "storage_caption"
-                storage.extra_data = current
+        if storage is None:
+            # [DIAG] پستِ بدون ویدئو (عکس، ویدیونوت، فایل غیر ویدئویی) قبلاً بی‌صدا
+            # رد می‌شد؛ حالا دلیلش در لاگ می‌آید.
+            logger.warning(
+                "CHANNEL_POST_SKIPPED chat=%s message=%s media=%s — "
+                "only a video or a video/* document is ingested",
+                message.chat.id,
+                message.message_id,
+                _media_kind(message),
+            )
+            return
+        stream_url = _safe_stream_url(message.caption or message.text)
+        if stream_url:
+            current = storage.extra_data or {}
+            current["stream_url"] = stream_url
+            current["stream_url_source"] = "storage_caption"
+            storage.extra_data = current
 
     if storage:
         # print() جایگزین شد — لاگ ساخت‌یافته با ماژول‌_logger (قابل فیلتر/جمع‌آوری)

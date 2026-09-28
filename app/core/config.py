@@ -84,7 +84,13 @@ class Settings:
     main_channel_id: int | None = _int_or_none(os.getenv("MAIN_CHANNEL_ID"), "MAIN_CHANNEL_ID")
     main_channel_username: str = os.getenv("MAIN_CHANNEL_USERNAME", "").strip()
     production_storage_chat_id: int | None = _int_or_none(
-        os.getenv("PRODUCTION_STORAGE_CHAT_ID"), "PRODUCTION_STORAGE_CHAT_ID"
+        # [FIX/CONSISTENCY] قبلاً فقط PRODUCTION_STORAGE_CHAT_ID خوانده می‌شد، در حالی
+        # که media_config و health-check هر دو TELEGRAM_STORAGE_CHAT_ID را هم قبول
+        # می‌کردند — نتیجه: هندلر ingest با دو کلیدِ ناهماهنگ، پست کانال را بی‌صدا
+        # رد می‌کرد. حالا هر دو کلید با همین اولویت (PRODUCTION > TELEGRAM) یکسان
+        # خوانده می‌شوند.
+        os.getenv("PRODUCTION_STORAGE_CHAT_ID") or os.getenv("TELEGRAM_STORAGE_CHAT_ID") or None,
+        "PRODUCTION_STORAGE_CHAT_ID",
     )
     test_storage_chat_id: int | None = _int_or_none(os.getenv("TEST_STORAGE_CHAT_ID"), "TEST_STORAGE_CHAT_ID")
     winapay_merchant_id: str = os.getenv("WINAPAY_MERCHANT_ID", "").strip()
