@@ -111,7 +111,14 @@ async def run_polling(dp: Dispatcher) -> None:
         dp.workflow_data["bot"] = bot
         # ثبت دستورات غیرمرگبار است (۳ بار تلاش و بعد ادامه) - در هر تلاش تکرار می‌شود
         await setup_commands(bot)
-        await dp.start_polling(bot, close_bot_session=False)
+        # [PERF] فقط انواع رخدادِ استفاده‌شده از تلگرام درخواست شود؛ updateهای
+        # اضافه (edited_message، message_reaction و ...) قبل از رسیدن به ربات
+        # دور ریخته می‌شوند — روی اتصال پرتأخیر/پراکسی‌دار تفاوت محسوس دارد.
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            close_bot_session=False,
+        )
     finally:
         # نشستِ باتِ همین تلاش را خودمان می‌بندیم تا نشت session رخ ندهد؛
         # تلاش بعدی (بعد از backoff در _supervised) باتِ تازه می‌سازد.
