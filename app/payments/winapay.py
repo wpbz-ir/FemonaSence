@@ -8,8 +8,45 @@ import httpx
 
 from app.core.config import settings
 from app.payments.base import PaymentStartResult, PaymentVerifyResult
+from app.services.runtime_payment_config import load_payment_config
 
 logger = logging.getLogger(__name__)
+
+# [INT-c] Runtime-config timeout bounds — mirror validate_payment_config()
+# (app/services/runtime_payment_config.py: 5..120 seconds); 30s is the same
+# default that module stores when the operator never touched the panel.
+_GATEWAY_TIMEOUT_MIN = 5.0
+_GATEWAY_TIMEOUT_MAX = 120.0
+_GATEWAY_TIMEOUT_DEFAULT = 30.0
+
+
+def _gateway_settings() -> tuple[str, float]:
+    """[INT-c] Read base_url/timeout from the RUNTIME payment config.
+
+    پیکربندی اجرایی (data/runtime/payment_gateway.json، ذخیره‌شده از پنل ادمین)
+    ملاک است؛ اگر فایل غایب یا ناقص باشد، load_payment_config() خودش به مقادیر
+    env (settings.winapay_base_url / پیش‌فرض‌ها) fallback می‌کند. timeout بر حسب
+    ثانیه از پیکربندی خوانده و به بازه‌ی امن 5..120 محدود می‌شود.
+
+    https-only نگاه داشته می‌شود: حتی اگر JSON به‌صورت دستی با http:// دست‌کاری
+    شده باشد، این provider هرگز به نشانی غیر HTTPS درخواست نمی‌زند (پیکربندی
+    ذخیره‌شده از پنل هم از validate_payment_config همان تضمین را می‌گیرد).
+    خطا WinaPayError است تا مسیر فراخواننده‌ها (payments.py -> 502 + FAILED
+    attempt) ساختاریافته باقی بماند.
+    """
+    config = load_payment_config()
+    base_url = str(config.get("base_url") or settings.winapay_base_url).strip().rstrip("/")
+    if not base_url.startswith("https://"):
+        raise WinaPayError(
+            "WINAPAY_CONFIG_INVALID",
+            "نشانی پایه درگاه ویناپی باید با HTTPS باشد.",
+        )
+    try:
+        timeout = float(config.get("timeout_seconds", _GATEWAY_TIMEOUT_DEFAULT))
+    except (TypeError, ValueError):
+        timeout = _GATEWAY_TIMEOUT_DEFAULT
+    timeout = min(_GATEWAY_TIMEOUT_MAX, max(_GATEWAY_TIMEOUT_MIN, timeout))
+    return base_url, timeout
 
 
 class WinaPayError(Exception):
@@ -45,8 +82,12 @@ def _quantize_amount(amount_toman: Decimal, *, context: str) -> Decimal:
 class WinaPayProvider:
     name = "WINAPAY"
 
-    def __init__(self, *, timeout: float = 30.0) -> None:
-        self.timeout = timeout
+    def __init__(self, *, timeout: float | None = None) -> None:
+        # [INT-c] ``timeout`` is kept for backward compatibility but the EFFECTIVE
+        # per-request timeout now comes from the runtime payment config
+        # (data/runtime/payment_gateway.json -> load_payment_config, clamped to
+        # 5..120s) with the env/settings fallback inside _gateway_settings().
+        self.timeout = float(timeout) if timeout is not None else _GATEWAY_TIMEOUT_DEFAULT
 
     @property
     def merchant_id(self) -> str:
@@ -76,6 +117,17 @@ class WinaPayProvider:
                 error_message="حداقل مبلغ ویناپی 100 تومان است.",
             )
 
+        # [INT-c] base_url/timeout از پیکربندی runtime؛ خطای پیکربندی (http غیر
+        # مجاز) مثل خطای MerchantID با یک PaymentStartResult ساختاریافته برمی‌گردد.
+        try:
+            base_url, timeout = _gateway_settings()
+        except WinaPayError as exc:
+            return PaymentStartResult(
+                success=False,
+                error_code=exc.error_code,
+                error_message=exc.error_message,
+            )
+
         payload = urlencode(
             {
                 "MerchantID": self.merchant_id,
@@ -94,9 +146,9 @@ class WinaPayProvider:
         # actual body, so it is application/x-www-form-urlencoded (was wrongly
         # application/json — the gateway could reject every Toman payment).
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
                 response = await client.post(
-                    f"{settings.winapay_base_url.rstrip('/')}/PaymentRequest",
+                    f"{base_url}/PaymentRequest",
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     content=payload,
                 )
@@ -150,6 +202,9 @@ class WinaPayProvider:
             )
 
         amount = _quantize_amount(amount_toman, context="PaymentVerification")
+        # [INT-c] همان پیکربندی runtime مسیر Verify — خطای https بودنِ base_url
+        # اینجا مثل Authority نامعتبر به‌صورت WinaPayError ساختاریافته بالا می‌رود.
+        base_url, timeout = _gateway_settings()
         payload = urlencode(
             {
                 "MerchantID": self.merchant_id,
@@ -160,9 +215,9 @@ class WinaPayProvider:
         # [P0-8] Same contract as PaymentRequest: form-encoded body, JSON response,
         # declared Content-Type must be application/x-www-form-urlencoded.
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
                 response = await client.post(
-                    f"{settings.winapay_base_url.rstrip('/')}/PaymentVerification",
+                    f"{base_url}/PaymentVerification",
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     content=payload,
                 )

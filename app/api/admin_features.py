@@ -86,24 +86,31 @@ class AdStatusPayload(BaseModel):
 
 @router.post("/ads/requests/{request_id}/status", dependencies=[Depends(admin_gate)])
 async def ads_request_status(request_id: uuid.UUID, payload: AdStatusPayload, request: Request):
-    async with session_scope() as session:
-        row = await set_ad_request_status(
-            session,
-            request_id,
-            status=payload.status,
-            admin_note=payload.admin_note,
-        )
-        if row is None:
-            raise HTTPException(status_code=404, detail="درخواست پیدا نشد.")
-        await record_admin_action(
-            session,
-            action="ADS_REQUEST_STATUS",
-            entity_type="ad_request",
-            entity_id=row.id,
-            details={"status": row.status},
-            **_request_meta(request),
-        )
-        return {"ok": True, "id": str(row.id), "status": row.status}
+    try:
+        async with session_scope() as session:
+            row = await set_ad_request_status(
+                session,
+                request_id,
+                status=payload.status,
+                admin_note=payload.admin_note,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="درخواست پیدا نشد.")
+            await record_admin_action(
+                session,
+                action="ADS_REQUEST_STATUS",
+                entity_type="ad_request",
+                entity_id=row.id,
+                details={"status": row.status},
+                **_request_meta(request),
+            )
+            return {"ok": True, "id": str(row.id), "status": row.status}
+    except ValueError as exc:
+        # دستگاه وضعیت G19-a: گذار نامجاز (ردیف ترمینال/بررسی‌شده) → 409 نه 500.
+        raise HTTPException(
+            status_code=409,
+            detail="تغییر وضعیت مجاز نیست؛ این درخواست قبلاً بررسی یا منتشر شده است.",
+        ) from exc
 
 
 # ================= MEMBERSHIP (عضویت اجباری) =================

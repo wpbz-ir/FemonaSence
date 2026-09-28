@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html
 import json
+import re
 from decimal import Decimal
 from uuid import UUID
 
@@ -18,11 +20,25 @@ from app.runtime.db import session_scope
 from app.services.billing import create_star_order, plan_stars, settle_star_payment
 from app.services.coupons import normalize_coupon_code, preview_coupon
 from app.services.pricing import plan_toman_price
+from app.services.rate_limit import RateLimitExceeded, RateLimitUnavailable, enforce
 from app.services.user_account import ensure_user
 from app.services.winapay_billing import create_winapay_subscription_order, create_winapay_wallet_order
 
 
 router = Router(name="payments")
+
+# [5-INT-b] سقف منطقی شارژ کیف پول (تومان) — callbackهای cv:wallet:<int> بزرگ‌تر از این
+# مقدار بدون ساخت سفارش رد می‌شوند (پیام فارسی).
+MAX_WALLET_TOPUP_TOMAN = 100_000_000
+
+# [5-INT-b / 5-G15-e R4] اکوی کد تخفیف در متنِ HTML فقط با کاراکترهای امن:
+# هرچه خارج از [A-Za-z0-9_-] باشد (مثل < > &) قبل از echo حذف می‌شود؛
+# normalize_coupon_code فقط upper/فاصله‌گیری می‌کند و تگ‌ها را حذف نمی‌کند.
+_COUPON_ECHO_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _safe_coupon_echo(code: str | None) -> str:
+    return _COUPON_ECHO_UNSAFE.sub("", code or "")[:32]
 
 
 class CouponState(StatesGroup):
@@ -100,11 +116,13 @@ async def show_plans(target: CallbackQuery | Message, state: FSMContext | None =
             rows.append(buttons)
     rows.append([InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")])
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    # [5-INT-b] اکوی کد در متن HTML فقط با نویسه‌های امن (R4).
+    coupon_echo = _safe_coupon_echo(coupon_code)
     text = (
         f"<b>💎 اشتراک {BRAND_NAME_FA}</b>\n\n"
         "اشتراک موردنظر را انتخاب کنید.\n"
         "پرداخت با Telegram Stars یا درگاه بانکی ویناپی انجام می‌شود.\n"
-        + (f"\nکد تخفیف «{coupon_code}» برای گزینه‌های مجاز اعمال می‌شود." if coupon_code else "")
+        + (f"\nکد تخفیف «{coupon_echo}» برای گزینه‌های مجاز اعمال می‌شود." if coupon_echo else "")
     )
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=markup)
@@ -154,9 +172,25 @@ async def coupon_message(message: Message, state: FSMContext):
     if not code:
         await message.answer("کد تخفیف معتبر نیست. دوباره ارسال کنید.")
         return
+    # [5-INT-b / 5-G13-c #3] پیش‌نمایشِ کد، اوراکل وجود تخفیف است؛ ورودیِ نامحدودِ
+    # کد → حدس زدن/شمارش کدهای فعال. هر ارسال کد = حداکثر ۵ تلاش در دقیقه.
+    # شکستِ limiter عمداً fail-open است (قطع Redis نباید ورود کد تخفیف را ببندد).
+    try:
+        await enforce(f"coupon:{message.from_user.id}", limit=5, window_seconds=60)
+    except RateLimitExceeded:
+        await message.answer(
+            "تعداد تلاش‌های وارد کردن کد تخفیف بیش از حد مجاز است. لطفاً کمی بعد دوباره تلاش کنید."
+        )
+        return
+    except RateLimitUnavailable:
+        pass
     await state.update_data(coupon_code=code)
     await state.set_state(CouponState.code)
-    await message.answer(f"✅ کد «{code}» ثبت شد. پلن موردنظر را انتخاب کنید:")
+    coupon_echo = _safe_coupon_echo(code)
+    if coupon_echo:
+        await message.answer(f"✅ کد «{coupon_echo}» ثبت شد. پلن موردنظر را انتخاب کنید:")
+    else:
+        await message.answer("✅ کد تخفیف ثبت شد. پلن موردنظر را انتخاب کنید:")
     await show_plans(message, state)
 
 
@@ -224,7 +258,9 @@ async def buy_winapay(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="↩️ اشتراک‌ها", callback_data="menu:subscription")],
     ])
     await callback.message.edit_text(
-        f"<b>💳 پرداخت بانکی</b>\n\n{plan.name_fa}\nمبلغ نهایی: <b>{_toman(amount)}</b>\n\nبرای ادامه وارد درگاه شوید.",
+        # [5-INT-b / 5-G15-e R3] name_fa ادمی-کنترل است و sanitize نمی‌شود؛ در متنِ
+        # parse_mode=HTML باید escape شود وگرنه < > & پیامِ پرداخت کاربر را می‌شکند.
+        f"<b>💳 پرداخت بانکی</b>\n\n{html.escape(plan.name_fa, quote=False)}\nمبلغ نهایی: <b>{_toman(amount)}</b>\n\nبرای ادامه وارد درگاه شوید.",
         reply_markup=markup,
     )
 
@@ -232,6 +268,13 @@ async def buy_winapay(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.regexp(r"^cv:wallet:\d+$"))
 async def wallet_topup(callback: CallbackQuery):
     amount = int(callback.data.split(":", 2)[2])
+    # [5-INT-b] سقف منطقی مبلغ شارژ (مقادیر غیرمنتظره/دست‌کاری‌شده‌ی callback رد می‌شوند).
+    if amount > MAX_WALLET_TOPUP_TOMAN:
+        await callback.answer(
+            "مبلغ شارژ کیف پول حداکثر ۱۰۰٬۰۰۰٬۰۰۰ تومان است.",
+            show_alert=True,
+        )
+        return
     await callback.answer()
     if not _bank_payment_available():
         await callback.message.answer("پرداخت بانکی فقط پس از تنظیم Merchant ID و نشانی عمومی HTTPS فعال می‌شود.")
@@ -242,7 +285,8 @@ async def wallet_topup(callback: CallbackQuery):
             await callback.message.answer("حساب کاربری شما فعال نیست.")
             return
         order, _attempt, token = await create_winapay_wallet_order(session, user_id=user.id, amount_toman=amount)
-        await session.commit()
+        # [5-INT-b / P1-21] کامیتِ تکراری حذف شد — session_scope در خروج، تنها نقطه‌ی
+        # کامیت است؛ کامیت داخلی قبلی یک نقطه‌ی commit دومِ زائد بود.
     url = f"{settings.public_base_url}/payments/winapay/start/{token}"
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 ورود به درگاه", url=url)],

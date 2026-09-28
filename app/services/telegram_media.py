@@ -1,13 +1,38 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import shutil
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 from sqlalchemy import text
 
 from app.bot.session import telegram_aiohttp_connector
+
+logger = logging.getLogger(__name__)
+
+# [INT-c] Hard download cap: pre-flight reject on getFile's file_size plus a
+# running byte cap inside the chunk loop. 2.5 GB gives the 2 GB local Bot API
+# upload limit comfortable headroom while bounding disk-exhaustion from a
+# malicious/compromised endpoint reporting a bogus (or no) file_size.
+MAX_DOWNLOAD_BYTES = 2_500_000_000
+
+
+def _local_bot_api_data_dir() -> Path:
+    """دایرکتوری داده‌ی سرور Bot API محلی (پیش‌فرض رسمی telegram-bot-api --local).
+
+    با TELEGRAM_LOCAL_FILE_ROOT (همان متغیری که مستندات استقرار برای ریشه‌ی
+    فایل‌های Bot API محلی تعریف می‌کنند) قابل بازنویسی است. عمداً per-call
+    خوانده می‌شود، نه import-time — چون media_worker پس از import ماژول‌ها
+    load_dotenv() را اجرا می‌کند و خواندن زودهنگام .env را از دست می‌دهد.
+    """
+    return Path(
+        os.getenv("TELEGRAM_LOCAL_FILE_ROOT", "/var/lib/telegram-bot-api").strip()
+        or "/var/lib/telegram-bot-api"
+    ).resolve()
 
 
 class TelegramMediaError(RuntimeError):
@@ -22,7 +47,14 @@ class TelegramMediaClient:
             raise TelegramMediaError("BOT_TOKEN_MISSING", "BOT_TOKEN is not configured")
         self.token = token
         self.base_url = base_url.rstrip("/")
-        self.timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
+        # Bot API محلی = هر base_url‌ای غیر از کلود رسمی (همان تشخیص telegram_storage).
+        self.local_bot_api = (urlsplit(self.base_url).hostname or "").lower() not in {"api.telegram.org"}
+        # [INT-c] FINITE total timeout (was total=None): a dribbling stalled
+        # transfer used to hang forever while _lease_heartbeat kept the lease
+        # fresh, so recovery never fired and the job stayed RUNNING forever.
+        # total=3600 bounds the whole download; sock_read still catches a
+        # stalled connection inside it.
+        self.timeout = aiohttp.ClientTimeout(total=3600, connect=60, sock_read=300)
 
     def _url(self, method: str) -> str:
         return f"{self.base_url}/bot{self.token}/{method}"
@@ -30,20 +62,32 @@ class TelegramMediaClient:
     def _file_url(self, path: str) -> str:
         return f"{self.base_url}/file/bot{self.token}/{path.lstrip('/') }"
 
-    async def get_stream_source(self, file_id: str) -> dict:
-        """Resolve a Telegram file to either a local path or an internal upstream URL.
+    def _safe_local_copy_source(self, raw_file_path: str) -> Path | None:
+        """اعتبارسنجی مسیر مطلقِ برگشتی از getFile سرور Bot API محلی.
 
-        The returned URL is server-internal and must never be sent to the browser.
+        [Path Guard] پاسخ getFile در حالت local می‌تواند یک مسیر فایل‌سیستم
+        باشد؛ این مسیر ورودیِ اعتمادنشده است و بدون محدودسازی، کپیِ آن یعنی
+        خواندن دلخواه فایل از سرور. فقط وقتی (۱) کلاینت واقعاً به Bot API
+        محلی وصل است، (۲) مسیر مطلق است و (۳) پس از resolve (شکستن symlink)،
+        زیر دایرکتوری داده‌ی همان سرور می‌ماند، مسیرِ امن برگردانده می‌شود؛
+        در هر حالت دیگر (کلود، مسیر نسبی، ../ ترِورسال، بیرون از پیشوند)
+        None برمی‌گردد تا دانلود از مسیر HTTP فایل انجام شود.
         """
-        info = await self.get_file(file_id)
-        file_path = str(info.get("file_path") or "").strip()
-        if not file_path:
-            raise TelegramMediaError("FILE_PATH_MISSING", "Telegram did not return file_path")
-
-        path = Path(file_path)
-        if path.is_absolute() and path.exists():
-            return {"kind": "local", "path": str(path), "file_path": file_path}
-        return {"kind": "upstream", "url": self._file_url(file_path), "file_path": file_path}
+        if not self.local_bot_api:
+            return None
+        candidate = Path(raw_file_path)
+        if not candidate.is_absolute():
+            return None
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(_local_bot_api_data_dir())
+        except (OSError, ValueError):
+            logger.warning(
+                "getFile file_path خارج از دایرکتوری داده‌ی Bot API محلی رد شد: %.300s",
+                raw_file_path,
+            )
+            return None
+        return resolved
 
     async def _json(self, session, method: str, *, params=None, data=None):
         async with session.post(self._url(method), params=params, data=data, timeout=self.timeout) as response:
@@ -59,13 +103,33 @@ class TelegramMediaClient:
 
     async def download_file(self, *, file_id: str, destination: Path) -> dict:
         info = await self.get_file(file_id)
+        # [INT-c] Pre-flight size cap: reject BEFORE touching the disk when the
+        # provider reports a file_size over MAX_DOWNLOAD_BYTES.
+        reported_size = info.get("file_size")
+        try:
+            reported_size = int(reported_size) if reported_size is not None else None
+        except (TypeError, ValueError):
+            reported_size = None
+        if reported_size is not None and reported_size > MAX_DOWNLOAD_BYTES:
+            raise TelegramMediaError(
+                "FILE_TOO_LARGE",
+                f"File size {reported_size} exceeds the {MAX_DOWNLOAD_BYTES} byte download cap",
+            )
+
         file_path = str(info.get("file_path") or "")
         if not file_path:
             raise TelegramMediaError("FILE_PATH_MISSING", "Telegram did not return file_path")
 
-        # Local Bot API may return an absolute filesystem path. Use it directly when visible to the worker.
-        candidate = Path(file_path)
-        if candidate.is_absolute() and candidate.exists():
+        # [Path Guard] فقط در حالت Bot API محلی و فقط برای مسیرهای مطلقِ داخل
+        # دایرکتوری داده‌ی همان سرور، کپی مستقیم انجام می‌شود؛ بقیهٔ حالت‌ها
+        # (و هر مسیر مشکوک) به دانلود HTTP فایل می‌روند.
+        candidate = self._safe_local_copy_source(file_path)
+        if candidate is not None and candidate.exists():
+            if candidate.stat().st_size > MAX_DOWNLOAD_BYTES:
+                raise TelegramMediaError(
+                    "FILE_TOO_LARGE",
+                    f"Local Bot API file exceeds the {MAX_DOWNLOAD_BYTES} byte download cap",
+                )
             destination.parent.mkdir(parents=True, exist_ok=True)
             # کپی فایل حجیم روی thread انجام می‌شود تا event loop بلاک نشود.
             await asyncio.to_thread(shutil.copy2, candidate, destination)
@@ -77,9 +141,25 @@ class TelegramMediaClient:
             async with session.get(url) as response:
                 if response.status >= 400:
                     raise TelegramMediaError("TELEGRAM_FILE_DOWNLOAD_FAILED", f"HTTP {response.status}")
+                received = 0
+                exceeded_cap = False
                 with destination.open("wb") as output:
                     async for chunk in response.content.iter_chunked(1024 * 1024):
+                        received += len(chunk)
+                        # [INT-c] Running byte cap: the server may lie about (or
+                        # omit) file_size, so the stream itself is capped too.
+                        if received > MAX_DOWNLOAD_BYTES:
+                            exceeded_cap = True
+                            break
                         await asyncio.to_thread(output.write, chunk)
+                if exceeded_cap:
+                    # Close first (the with-block above), then unlink — safe on
+                    # Windows too, where unlinking an open file fails.
+                    destination.unlink(missing_ok=True)
+                    raise TelegramMediaError(
+                        "FILE_TOO_LARGE",
+                        f"Download exceeded the {MAX_DOWNLOAD_BYTES} byte cap mid-stream",
+                    )
         return info
 
     async def send_video(self, *, chat_id: int | str, path: Path, caption: str, width: int | None = None, height: int | None = None, duration: int | None = None) -> dict:
@@ -97,7 +177,9 @@ class TelegramMediaClient:
                 filename=path.name,
                 content_type="video/mp4",
             )
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=60, sock_read=600), connector=telegram_aiohttp_connector()) as session:
+            # [INT-c] FINITE total timeout here too (was total=None) — same
+            # stalled-forever hazard as the download path.
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600, connect=60, sock_read=600), connector=telegram_aiohttp_connector()) as session:
                 return await self._json(session, "sendVideo", data=form)
 
 

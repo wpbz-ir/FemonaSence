@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.core.database import async_database_url
+from app.core.database import async_engine_kwargs_from_url
 from app.services.media_jobs import enqueue_transcode
 
 
@@ -23,9 +23,10 @@ async def main() -> None:
     parser.add_argument("--priority", type=int, default=50)
     args = parser.parse_args()
 
+    # [INT-c/M3] Same Neon pooler guard (statement_cache_size=0) as the app
+    # engine, via the shared helper in app/core/database.py.
     engine = create_async_engine(
-        async_database_url(os.getenv("DATABASE_URL", "")),
-        pool_pre_ping=True,
+        **async_engine_kwargs_from_url(os.getenv("DATABASE_URL", "")),
     )
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     source_release_id = UUID(args.source_release)

@@ -1,3 +1,5 @@
+> ⚠️ سند تاریخی/منسوخ — ممکن است با نسخه فعلی مخزن (head مایگریشن: 0017_ads_system) هم‌خوان نباشد. مرجع روزآمد: docs/ARCHITECTURE_FA.md و deploy/README_PRODUCTION_FA.md
+
 # ممیزی نهایی Phase 13 تا 18 — فمونا سنس
 
 ## مبنای بررسی

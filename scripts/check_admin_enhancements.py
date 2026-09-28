@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -135,10 +136,11 @@ def main() -> None:
             raise AssertionError(f"stale local-font reference remains in admin.html: {stale}")
 
     # Parse the inline JavaScript with the installed Node runtime when available.
+    # The extracted JS goes into a throwaway temp dir (NEVER into the repo root).
     scripts = re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", html, flags=re.I | re.S)
     js = "\n\n".join(scripts)
-    js_path = ROOT / "_admin_inline_check.js"
-    try:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        js_path = Path(tmp_dir) / "_admin_inline_check.js"
         js_path.write_text(js, encoding="utf-8")
         try:
             node = subprocess.run(["node", "--check", str(js_path)], text=True, capture_output=True)
@@ -146,8 +148,6 @@ def main() -> None:
             node = None  # [P0-10] Node not installed here; skip the JS syntax gate
         if node is not None and node.returncode != 0:
             raise AssertionError("admin.html inline JavaScript failed node --check: " + node.stderr.strip())
-    finally:
-        js_path.unlink(missing_ok=True)
 
     # Every direct DOM lookup in the Admin script must have a corresponding HTML id.
     ids = set(re.findall(r"\bid=[\"']([^\"']+)[\"']", html))

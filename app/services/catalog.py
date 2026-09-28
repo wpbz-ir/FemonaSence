@@ -107,12 +107,20 @@ async def top_imdb_titles(session, *, limit: int = 20):
     )
 
 
+def _escape_like(term: str) -> str:
+    # [P1-15] کاربر نباید با % و _ رفتار LIKE را عوض کند؛ کاراکترهای wildcard با
+    # بک‌اسلش escape می‌شوند (escape پیش‌فرض LIKE/ILIKE در PostgreSQL همان بک‌اسلش
+    # است — قرارداد مشترک با app/api/admin_extended.py::_escape_like) و مقدار
+    # همچنان به‌صورت پارامتر bound ارسال می‌شود، پس فقط wildcard-injection خنثی می‌شود.
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 async def search_titles(session, query: str, *, limit: int = 20):
     q = query.strip()
     if not q:
         return []
 
-    like = f"%{q}%"
+    like = f"%{_escape_like(q)}%"
     cols = _mapped(Title)
     matches = []
     for name in ("title_fa", "title_en", "original_title", "slug"):

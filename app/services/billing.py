@@ -99,10 +99,16 @@ async def settle_star_payment(session, *, order, attempt, successful_payment):
         raise ValueError("تلاش پرداخت پیدا نشد.")
 
     charge_id = successful_payment.telegram_payment_charge_id
+    # [P1-13] Idempotency lookup is scoped to THIS order: a charge_id is globally
+    # unique per Telegram payment, so if it ever surfaced against a different
+    # order (replay/collision) this order must NOT be marked PAID from another
+    # order's payment row. Global uniqueness remains enforced by
+    # uq_payments_provider_reference at the DB level.
     existing = await session.scalar(
         select(Payment).where(
             Payment.provider == "TELEGRAM_STARS",
             Payment.provider_reference == charge_id,
+            Payment.order_id == order.id,
         )
     )
     if existing:

@@ -154,6 +154,21 @@ async def prepare_winapay_payment(session, *, order: Order, attempt: PaymentAtte
 
 
 async def settle_winapay_order(session, *, order_id, callback_payload: dict):
+    """[P1-13] Three-phase settle so the 30s gateway verify never runs inside a
+    transaction that holds row locks (canonical P1-13 / 4-G08-c F3):
+
+      Phase A — read order + attempt WITHOUT FOR UPDATE + sanity checks, then
+                COMMIT (ends the read txn; nothing is locked during the HTTP call;
+                app/api/payments.py no longer locks the order before calling us).
+      Phase V — gateway verify OUTSIDE any transaction.
+      Phase B — short write txn: re-SELECT order FOR UPDATE, re-check not already
+                PAID (idempotent), then settle/credit/redeem exactly as before.
+
+    All previous guards are preserved: verify amount compare, RefID dedupe via
+    uq_payments_provider_reference, wallet-ledger unique external_reference,
+    coupon redeem-once.
+    """
+    # ---- Phase A: lock-free read + sanity checks.
     order = await session.scalar(select(Order).where(Order.id == order_id))
     if order is None:
         raise ValueError("سفارش پیدا نشد.")
@@ -173,28 +188,59 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
     if attempt is None or not attempt.authority:
         raise ValueError("تلاش پرداخت معتبر پیدا نشد.")
 
+    attempt_authority = attempt.authority
     amount_toman = Decimal(order.amount_toman or attempt.requested_amount_toman or 0)
+
+    # End the Phase-A read txn: the HTTP verify below must run with NO open
+    # transaction and NO row lock (pool-exhaustion / lock-stall guard).
+    await session.commit()
+
+    # ---- Phase V: gateway verify OUTSIDE any txn (30s timeout is normal here).
     provider = WinaPayProvider()
     result = await provider.verify_payment(
-        authority=attempt.authority,
+        authority=attempt_authority,
         amount_toman=amount_toman,
         callback_payload=callback_payload,
     )
-    attempt.raw_callback = callback_payload
+
+    async def _verify_failure(message: str) -> None:
+        """Persist a verify failure: FAILED attempt (with the raw callback payload)
+        + release the coupon reservation so the per-user/max-uses quota is not
+        leaked until the 30-min TTL (canonical P1-13 / 4-G01-c finding 2)."""
+        fresh_attempt = await session.scalar(
+            select(PaymentAttempt)
+            .where(PaymentAttempt.order_id == order_id, PaymentAttempt.provider == "WINAPAY")
+            .order_by(PaymentAttempt.created_at.desc())
+            .with_for_update()
+        )
+        if fresh_attempt is not None:
+            fresh_attempt.status = "FAILED"
+            fresh_attempt.error_message = (message or "verify_failed")[:4000]
+            fresh_attempt.raw_callback = callback_payload
+        await release_coupon_for_order(session, order_id=order_id)
+
     if not result.success:
-        attempt.status = "FAILED"
-        attempt.error_message = result.error_message or result.error_code
-        await release_coupon_for_order(session, order_id=order.id)
+        await _verify_failure(result.error_message or result.error_code or "verify_failed")
         return None
 
-    if result.amount is not None and Decimal(result.amount) != amount_toman:
-        attempt.status = "FAILED"
-        attempt.error_message = "مبلغ Verify شده با سفارش مطابقت ندارد."
+    # [P1-13][4-G08-c F7] Gateway Amount is MANDATORY in the verify response: a
+    # missing amount is a verify FAILURE (never skip-compare), and any mismatch
+    # now releases the coupon reservation (it used to leak the reservation).
+    if result.amount is None:
+        await _verify_failure("پاسخ Verify ویناپی فاقد مبلغ است.")
+        return None
+    if Decimal(result.amount) != amount_toman:
+        await _verify_failure("مبلغ Verify شده با سفارش مطابقت ندارد.")
         return None
 
-    provider_reference = str(result.provider_reference or callback_payload.get("RefID") or "")
+    # [P1-13][4-G08-c F4] provider_reference must come from the VERIFY RESPONSE
+    # only — the user-controlled callback RefID fallback is REMOVED (a forged RefID
+    # used to become the idempotency key against uq_payments_provider_reference).
+    # Missing/blank RefID in a Status=100 response is a verify failure too.
+    provider_reference = str(result.provider_reference or "").strip()
     if not provider_reference:
-        raise ValueError("RefID ویناپی در Verify وجود ندارد.")
+        await _verify_failure("RefID ویناپی در پاسخ Verify وجود ندارد.")
+        return None
 
     order = await session.scalar(
         select(Order).where(Order.id == order_id).with_for_update()
@@ -216,6 +262,7 @@ async def settle_winapay_order(session, *, order_id, callback_payload: dict):
     )
     if attempt is None:
         raise ValueError("تلاش پرداخت معتبر پیدا نشد.")
+    attempt.raw_callback = callback_payload
 
     existing = await session.scalar(
         select(Payment).where(

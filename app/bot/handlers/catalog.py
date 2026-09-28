@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from html import escape
 from uuid import UUID
 
@@ -37,6 +38,8 @@ from app.utils.telegram_ui import edit_or_send
 router = Router(name="catalog")
 
 _edit_or_send = edit_or_send
+
+logger = logging.getLogger(__name__)
 
 
 class SearchState(StatesGroup):
@@ -413,6 +416,12 @@ async def search_message(message: Message, state: FSMContext):
         # state کهنه پاک می‌شود و رخداد به هندلرهای دستور روترهای بعدی واگذار می‌گردد.
         await state.clear()
         raise SkipHandler
+    # [P1-15] سقف ورودی جستجو (۶۴ نویسه) + نادیده گرفتن ورودی خالی (مثلاً فقط فاصله).
+    text = text.strip()[:64]
+    if not text:
+        # جستجو انجام نمی‌شود؛ کاربر در حالت جستجو می‌ماند تا نام را کامل بفرستد.
+        await message.answer("🔎 برای جستجو، نام عنوان را ارسال کنید.")
+        return
     async with session_scope() as session:
         items = await search_titles(session, text, limit=20)
     await state.clear()
@@ -475,7 +484,14 @@ async def _render_title(callback: CallbackQuery, title_id: UUID):
             )
             return
         except Exception:
-            pass
+            # [P1-15] بلع بی‌صدای ارسال صفحه عنوان (مسیر عکس) باعث dead-air می‌شود؛
+            # خطا لاگ می‌شود و رفتار قبلی (fallback به edit_or_send) حفظ می‌شود.
+            logger.warning(
+                "catalog title page photo send failed (title_id=%s chat=%s) — falling back to edit_or_send",
+                title_id,
+                callback.from_user.id,
+                exc_info=True,
+            )
 
     await _edit_or_send(callback, caption, reply_markup=keyboard)
 

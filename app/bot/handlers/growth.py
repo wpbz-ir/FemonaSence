@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from html import escape
 from urllib.parse import quote
 from uuid import UUID
 
@@ -12,10 +14,12 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InputTextMessageContent,
 )
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.runtime.db import session_scope
-from app.services.catalog import search_titles, title_text
+from app.services.catalog import clean_caption, search_titles, title_text
 from app.services.growth import (
     ensure_referral_code,
     record_rating,
@@ -27,6 +31,8 @@ from app.services.user_account import ensure_user
 from app.utils.telegram_ui import edit_or_send as _edit_or_send
 
 router = Router(name="growth")
+
+logger = logging.getLogger(__name__)
 
 
 # ---------- 🎁 دعوت دوستان (رفرال) ----------
@@ -119,6 +125,18 @@ async def suggest_callback(callback: CallbackQuery):
 
 # ---------- ⭐ امتیازدهی بعد از دانلود ----------
 
+_RATE_RELEASE_SQL = """
+    SELECT 1
+    FROM releases r
+    LEFT JOIN episodes e ON e.id = r.episode_id
+    LEFT JOIN seasons s ON s.id = e.season_id
+    LEFT JOIN series se ON se.id = s.series_id
+    JOIN titles t ON t.id = COALESCE(r.title_id, se.title_id)
+    WHERE r.id = :rid
+      AND COALESCE(UPPER(t.status), '') IN ('PUBLISHED', 'ACTIVE', 'PUBLIC')
+"""
+
+
 @router.callback_query(F.data.regexp(r"^cv:rate:.+$"))
 async def rate_callback(callback: CallbackQuery):
     parts = callback.data.split(":")
@@ -131,15 +149,53 @@ async def rate_callback(callback: CallbackQuery):
     except ValueError:
         await callback.answer()
         return
-    async with session_scope() as session:
-        user = await ensure_user(session, callback.from_user)
-        await record_rating(session, user_id=user.id, title_id=None, release_id=release_id, value=value)
-    await callback.answer("✅ ممنون از نظر شما!" if value else "🙏 ثبت شد. کیفیت را بررسی می‌کنیم.", show_alert=True)
+
+    # [5-INT-b / 5-G15-c F4] اولین callback.answer() بلافاصله و قبل از هر کار DB —
+    # اسپینرِ کلاینت بدون توجه به نتیجه آزاد می‌شود (dead-air ممنوع).
+    await callback.answer()
+
+    async def _notify_failure(text_: str) -> None:
+        """هشدار خطا: پاسِ دوم ممکن است تلگرام نپذیرد؛ پیامِ جایگزین می‌فرستیم."""
+        try:
+            await callback.answer(text_, show_alert=True)
+        except Exception:
+            if callback.message is not None:
+                try:
+                    await callback.message.answer(text_)
+                except Exception:
+                    pass
+
+    try:
+        async with session_scope() as session:
+            # [5-INT-b / 5-G15-c F4] اعتبارسنجی وجود نسخه + عمومی‌بودن عنوان قبل از
+            # record_rating — هر UUID معتبر دیگر بدون بررسی رکورد نمی‌سازد
+            # (IntegrityError FK از قبل مهار شده و رأیِ محتوای نامرئی ثبت نمی‌شود).
+            exists = (
+                await session.execute(text(_RATE_RELEASE_SQL), {"rid": release_id})
+            ).first()
+            if exists is None:
+                await _notify_failure("این نسخه برای امتیازدهی در دسترس نیست.")
+                return
+            user = await ensure_user(session, callback.from_user)
+            await record_rating(session, user_id=user.id, title_id=None, release_id=release_id, value=value)
+    except IntegrityError:
+        # مسابقه/کلید خارجی — ثبت نشد؛ لاگ + پاس فارسی.
+        logger.warning("record_rating failed (release_id=%s)", release_id, exc_info=True)
+        await _notify_failure("ثبت نشد. لطفاً دوباره تلاش کنید.")
+        return
     if callback.message:
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
+    # پیام تشکر به‌صورت بهترین‌تلاش (پاس اول مصرف شده؛ در صورت رد شدن تلگرام نادیده گرفته می‌شود).
+    try:
+        await callback.answer(
+            "✅ ممنون از نظر شما!" if value else "🙏 ثبت شد. کیفیت را بررسی می‌کنیم.",
+            show_alert=True,
+        )
+    except Exception:
+        pass
 
 
 # ---------- 🔎 جستجوی سریع (Inline Mode) ----------
@@ -155,7 +211,12 @@ async def inline_search(query: InlineQuery):
 
     results = []
     for t in titles:
-        name = title_text(t)[:64] or "عنوان"
+        # [P1-15] قرارداد مشترک با handlers/catalog.py::_safe: اول حذف تگ‌ها، بعد escape.
+        # نسخه‌ی بدون escape فقط برای فیلدهای متنی سادهٔ نتیجهٔ اینلاین (title/description)
+        # استفاده می‌شود؛ هر echo در متن پیام با parse_mode=HTML باید escape شود وگرنه
+        # کاراکترهای < > & پارس mode را می‌شکنند (TelegramBadRequest) یا تزریق HTML می‌شوند.
+        plain_name = clean_caption(title_text(t), 64).strip() or "عنوان"
+        name = escape(plain_name, quote=False)
         meta = []
         if getattr(t, "release_year", None):
             meta.append(str(t.release_year))
@@ -173,7 +234,7 @@ async def inline_search(query: InlineQuery):
         thumbnail = thumbnail if isinstance(thumbnail, str) and thumbnail.startswith("https://") else None
         article = InlineQueryResultArticle(
             id=str(t.id),
-            title=name,
+            title=plain_name,
             description=description,
             thumbnail_url=thumbnail,
             input_message_content=content,
@@ -185,4 +246,10 @@ async def inline_search(query: InlineQuery):
     try:
         await query.answer(results, cache_time=30, is_personal=True)
     except Exception:
-        pass
+        # [P1-15] بلع بی‌صدای خطای answer باعث dead-air می‌شود؛ قابل‌تشخیص لاگ می‌شود.
+        logger.warning(
+            "inline search answer failed (term=%r results=%d)",
+            term,
+            len(results),
+            exc_info=True,
+        )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -41,7 +43,9 @@ def _gate_text(missing) -> str:
     lines = ["🔐 <b>ورود به فمونا سنس</b>", "", "برای استفاده از امکانات ربات، ابتدا در کانال‌های زیر عضو شوید:", ""]
     for index, channel in enumerate(missing, start=1):
         label = channel.title or (f"@{channel.username}" if channel.username else "کانال")
-        lines.append(f"{index}️⃣ <b>{label}</b>")
+        # [5-INT-b / 5-G15-e R5] عنوان کانال ادمی-کنترل است و sanitize نمی‌شود؛
+        # بدون escape، یک < > & در عنوان، پیامِ دروازه‌ی همه‌ی کاربران را می‌شکند.
+        lines.append(f"{index}️⃣ <b>{html.escape(label, quote=False)}</b>")
     lines += ["", "پس از عضویت، روی دکمه «✅ بررسی عضویت» بزنید."]
     return "\n".join(lines)
 

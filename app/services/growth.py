@@ -2,6 +2,8 @@
 امتیازدهی، گزارش هفتگی ادمین، وین‌بک اشتراک و بک‌آپ خودکار دیتابیس."""
 from __future__ import annotations
 
+import asyncio
+import html
 import json
 import logging
 import os
@@ -10,8 +12,11 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.db.models import (
@@ -35,13 +40,33 @@ STATE_PATH = Path(os.getenv("CINEMAVAULT_RUNTIME_DIR", str(PROJECT_ROOT / "data"
 
 WINBACK_CODE = "SUBSCRIPTION_WINBACK"
 
+# [5-INT-b / 5-G14-e] مرزهای تقویمی (روزِ شنبه‌ی گزارش هفتگی، ساعت بک‌آپ، کلید
+# dedupe «یک‌بار در روز») باید بر پایه‌ی روز/ساعتِ محلیِ تهران باشند نه UTC —
+# ایران DST ندارد → Asia/Tehran همیشه UTC+03:30 ثابت است (همان الگوی
+# releases.py::_tehran_day_start_utc). اگر tzdb نبود، آفست ثابت ساخته می‌شود.
+try:
+    TEHRAN_TZ = ZoneInfo("Asia/Tehran")
+except ZoneInfoNotFoundError:  # pragma: no cover — محیط بدون tzdata (مثلاً ویندوز)
+    TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+
+def _tehran_now() -> datetime:
+    """زمانِ فعلی در منطقه‌ی زمانی تهران (datetime آگاه از آفست)."""
+    return datetime.now(TEHRAN_TZ)
+
 
 # ---------- state file ----------
 
 def _load_state() -> dict:
     try:
         return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}  # اولین اجرا — فایل هنوز ساخته نشده
     except (OSError, ValueError):
+        logger.warning(
+            "فایل وضعیت growth خوانده نشد (خراب یا ناخوانا)؛ از حالت خالی شروع می‌شود: %s",
+            STATE_PATH,
+        )
         return {}
 
 
@@ -84,21 +109,13 @@ async def record_download(session, *, user_id, release_id, title_id=None) -> Non
     await session.flush()
 
 
-async def daily_download_count(session, *, user_id) -> int:
-    return int(
-        await session.scalar(
-            select(func.count(DownloadHistory.id)).where(
-                DownloadHistory.user_id == user_id,
-                DownloadHistory.status == "SUCCESS",
-                DownloadHistory.created_at >= func.date_trunc("day", func.now()),
-            )
-        )
-        or 0
-    )
-
-
 async def top_downloads(session, *, days: int = 7, limit: int = 20) -> list[dict]:
-    """پربازدیدترین عنوان‌ها بر اساس دانلود واقعی (پشتیبانی از فیلم و قسمت سریال)."""
+    """پربازدیدترین عنوان‌ها بر اساس دانلود واقعی (پشتیبانی از فیلم و قسمت سریال).
+
+    [5-INT-b / 5-G15-c F1] فقط عنوان‌های عمومی — بدون فیلترِ status، عناوینِ
+    پیش‌نویس از این لیست به همه‌ی کاربران نشت می‌کردند (مقادیر status دقیقاً مثل
+    release_matrix.py / catalog.py).
+    """
     rows = (
         await session.execute(
             text(
@@ -113,6 +130,7 @@ async def top_downloads(session, *, days: int = 7, limit: int = 20) -> list[dict
                 JOIN titles t ON t.id = COALESCE(r.title_id, se.title_id)
                 WHERE d.status = 'SUCCESS'
                   AND d.created_at > CURRENT_TIMESTAMP - make_interval(days => :days)
+                  AND COALESCE(UPPER(t.status), '') IN ('PUBLISHED', 'ACTIVE', 'PUBLIC')
                 GROUP BY t.id, t.title_fa, t.title_en, t.original_title, t.poster_url
                 ORDER BY downloads DESC
                 LIMIT :lim
@@ -173,17 +191,31 @@ async def ensure_referral_code(session, *, user_id) -> ReferralCode:
     row = await session.scalar(select(ReferralCode).where(ReferralCode.user_id == user_id))
     if row:
         return row
-    for _ in range(10):
-        candidate = secrets.token_hex(4).upper()  # ۸ کاراکتری یکتا
-        exists = await session.scalar(select(ReferralCode).where(ReferralCode.code == candidate))
-        if not exists:
-            break
-    else:
-        candidate = _uuid.uuid4().hex[:8].upper()
-    row = ReferralCode(user_id=user_id, code=candidate, active=True)
-    session.add(row)
-    await session.flush()
-    return row
+    last_error: IntegrityError | None = None
+    for attempt in range(11):
+        # ۱۰ نامزد تصادفی ۸-کاراکتری + نامزد نهایی uuid — هر کدام در صورت برخورد
+        # با savepoint بازگردانی و با نامزد بعدی ادامه می‌یابد.
+        candidate = secrets.token_hex(4).upper() if attempt < 10 else _uuid.uuid4().hex[:8].upper()
+        row = ReferralCode(user_id=user_id, code=candidate, active=True)
+        session.add(row)
+        try:
+            # savepoint: رقابت هم‌زمان روی referral_codes.user_id (یکتا برای هر کاربر)
+            # یا uq_referral_codes_code (کد هم‌زمان برداشته‌شده) — در حالت اول ردیف
+            # برنده دوباره خوانده می‌شود، در حالت دوم نامزد بعدی امتحان می‌شود.
+            async with session.begin_nested():
+                await session.flush()
+        except IntegrityError as exc:
+            last_error = exc
+            existing = await session.scalar(
+                select(ReferralCode).where(ReferralCode.user_id == user_id)
+            )
+            if existing is not None:
+                return existing
+            continue
+        return row
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("referral code generation exhausted without an IntegrityError")
 
 
 async def referral_stats(session, *, user_id) -> dict:
@@ -220,6 +252,14 @@ async def link_referral(session, *, referred_user, code: str) -> dict:
     created_at = getattr(referred_user, "created_at", None)
     if created_at and (datetime.now(timezone.utc) - created_at) > timedelta(hours=24):
         return {"ok": False, "reason": None, "referrer_tg_id": None, "amount_irr": None}
+    # [P1-11] قفل ردیف کاربرِ معرفی‌شده قبل از بررسی «قبلاً معرفی شده» — دو کلیک/
+    # درخواست همزمان روی یک کاربر سری می‌شوند؛ تراکنش دوم پس از کامیت اولی، ردیف
+    # Referral را در بررسی زیر می‌بیند و بدون اعتبارِ پاداشِ دوم خارج می‌شود (idempotent).
+    locked_referred_id = await session.scalar(
+        select(User.id).where(User.id == referred_user.id).with_for_update()
+    )
+    if locked_referred_id is None:
+        return {"ok": False, "reason": None, "referrer_tg_id": None, "amount_irr": None}
     already = await session.scalar(select(Referral).where(Referral.referred_user_id == referred_user.id))
     if already:
         return {"ok": False, "reason": None, "referrer_tg_id": None, "amount_irr": None}
@@ -245,12 +285,27 @@ async def link_referral(session, *, referred_user, code: str) -> dict:
     session.add(reward)
 
     # اعتبار کیف پول معرف + ثبت دفترکل
-    wallet = await session.scalar(select(Wallet).where(Wallet.user_id == ref_code.user_id))
+    # [P1-11] SELECT .. FOR UPDATE روی ردیف کیف پول قبل از اعتبار — دو پاداش همزمان
+    # با معرفِ یکسان (کاربران متفاوت) دیگر lost-update نمی‌خورند؛ موجودی پس از قفل خوانده می‌شود.
+    wallet = await session.scalar(
+        select(Wallet).where(Wallet.user_id == ref_code.user_id).with_for_update()
+    )
     if wallet is None:
-        wallet = Wallet(user_id=ref_code.user_id, balance_irr=Decimal("0"))
+        wallet = Wallet(user_id=ref_code.user_id, balance_irr=Decimal("0"), version=1)
         session.add(wallet)
-        await session.flush()
+        try:
+            # savepoint: رقابت get-or-create روی wallets.user_id UNIQUE —
+            # کیف‌پولِ ساخته‌شده در تراکنش هم‌زمان دوباره خوانده می‌شود.
+            async with session.begin_nested():
+                await session.flush()
+        except IntegrityError:
+            wallet = await session.scalar(
+                select(Wallet).where(Wallet.user_id == ref_code.user_id).with_for_update()
+            )
+            if wallet is None:
+                raise
     wallet.balance_irr = Decimal(wallet.balance_irr or 0) + amount
+    wallet.version = int(wallet.version or 0) + 1
     session.add(
         WalletLedgerEntry(
             wallet_id=wallet.id,
@@ -339,11 +394,25 @@ async def weekly_report_data(session) -> dict:
         "users_total": await scalar("SELECT COUNT(*) FROM users"),
         "users_new": await scalar("SELECT COUNT(*) FROM users WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '7 days'"),
         "downloads_week": await scalar("SELECT COUNT(*) FROM download_history WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '7 days' AND status='SUCCESS'"),
-        "revenue_week_toman": await scalar(
+        # [P1-19/درآمد] محاسبه به تفکیک واحد پول — بدون هیچ تقسیم بین-واحدی:
+        # وین‌پی: amount_irr همیشه 0 ذخیره می‌شود و مبلغ واقعی تومانی در amount_toman است
+        # (winapay_billing.py:236-238) → جمعِ amount_toman.
+        "revenue_week_winapay_toman": await scalar(
             """
-            SELECT COALESCE(SUM(p.amount_irr),0)/10.0
+            SELECT COALESCE(SUM(p.amount_toman), 0)
             FROM payments p
-            WHERE p.status = 'PAID' AND p.created_at > CURRENT_TIMESTAMP - INTERVAL '7 days'
+            WHERE p.provider = 'WINAPAY' AND p.status = 'PAID'
+              AND p.created_at > CURRENT_TIMESTAMP - INTERVAL '7 days'
+            """
+        ),
+        # ستاره تلگرام: تعداد ستاره‌ها در amount_irr با currency='XTR' ذخیره می‌شود
+        # (billing.py:132) → این عدد «تعداد ستاره» است، نه ریال؛ جداگانه گزارش می‌شود.
+        "revenue_week_xtr_stars": await scalar(
+            """
+            SELECT COALESCE(SUM(p.amount_irr), 0)
+            FROM payments p
+            WHERE p.currency = 'XTR' AND p.status = 'PAID'
+              AND p.created_at > CURRENT_TIMESTAMP - INTERVAL '7 days'
             """
         ),
         "subs_expiring": await scalar("SELECT COUNT(*) FROM subscriptions WHERE status='ACTIVE' AND expires_at > CURRENT_TIMESTAMP AND expires_at < CURRENT_TIMESTAMP + INTERVAL '7 days'"),
@@ -376,9 +445,14 @@ def _fa(n) -> str:
 
 
 async def send_weekly_admin_report(bot) -> bool:
-    """گزارش هفتگی — فقط روزهای شنبه، یک‌بار در روز (قفل با فایل وضعیت)."""
-    today = datetime.now(timezone.utc).date()
-    if today.weekday() != 5:  # شنبه
+    """گزارش هفتگی — فقط روزهای شنبه، یک‌بار در روز (قفل با فایل وضعیت).
+
+    [5-INT-b / 5-G14-e] «شنبه» و کلیدِ dedupe بر پایه‌ی تاریخِ محلیِ تهران‌اند؛
+    نسخه‌ی UTC قبلی گزارش را ۳/۵ ساعت دیر می‌فرستاد (شنبه ۰۰:۰۰–۰۳:۲۹ تهران
+    هنوز «جمعه»ی UTC بود) و کلید dedupe روزِ UTC بود.
+    """
+    today = _tehran_now().date()
+    if today.weekday() != 5:  # شنبه (به تقویم تهران)
         return False
     state = _load_state()
     if state.get("last_report") == today.isoformat():
@@ -390,12 +464,21 @@ async def send_weekly_admin_report(bot) -> bool:
         )
         if settings.admin_user_id:
             admin_ids.add(settings.admin_user_id)
-    top_lines = "\n".join(f"  {i}️⃣ {name} — {_fa(dl)} دانلود" for i, (name, dl) in enumerate(data["top"], start=1)) or "  —"
+    # [P1-19/گزارش] html.escape(quote=False): نام عنوان‌ها ساختار HTML گزارش را خراب نکنند
+    # (parse_mode=HTML پیش‌فرض make_bot است). بدون تزریق/شکستن parse mode.
+    top_lines = (
+        "\n".join(
+            f"  {i}️⃣ {html.escape(str(name), quote=False)} — {_fa(dl)} دانلود"
+            for i, (name, dl) in enumerate(data["top"], start=1)
+        )
+        or "  —"
+    )
     report = (
         "📊 <b>گزارش هفتگی فمونا سنس</b>\n\n"
         f"👥 کاربران: {_fa(data['users_total'])} (+{_fa(data['users_new'])} این هفته)\n"
         f"⬇️ دانلودهای هفته: {_fa(data['downloads_week'])}\n"
-        f"💰 درآمد هفته: {_fa(data['revenue_week_toman'])} تومان\n"
+        f"💰 درآمد هفته (ریالی/تومانی): {_fa(data['revenue_week_winapay_toman'])} تومان\n"
+        f"⭐️ درآمد هفته (ستاره‌ای): {_fa(data['revenue_week_xtr_stars'])} ستاره\n"
         f"⏳ اشتراک‌های رو به انقضا (۷ روز): {_fa(data['subs_expiring'])}\n"
         f"📣 درخواست‌های تبلیغ در انتظار: {_fa(data['ads_pending'])}\n\n"
         f"🔥 پربازدیدهای هفته:\n{top_lines}"
@@ -405,7 +488,8 @@ async def send_weekly_admin_report(bot) -> bool:
         try:
             await bot.send_message(int(admin_id), report)
             sent = True
-        except Exception:
+        except Exception as exc:  # خطای ارسال به یک ادمین، ارسال به بقیه را نبند
+            logger.warning("ارسال گزارش هفتگی به ادمین %s ناموفق بود: %s", admin_id, exc)
             continue
     if sent:
         state["last_report"] = today.isoformat()
@@ -416,31 +500,52 @@ async def send_weekly_admin_report(bot) -> bool:
 # ---------- بک‌آپ خودکار دیتابیس ----------
 
 def _parse_db_url(url: str) -> tuple[str, str, str, str, str]:
-    """postgresql+psycopg://user:pass@host:port/db → (user, password, host, port, db)"""
-    rest = url.split("://", 1)[1]
-    userpass, hostpart = rest.rsplit("@", 1)
-    user, password = userpass.split(":", 1)
-    hostport, db = hostpart.split("/", 1)
-    host, _, port = hostport.partition(":")
-    return user, password, host or "localhost", port or "5432", db
+    """postgresql+psycopg://user:pass@host:port/db?sslmode=require → (user, password, host, port, db)
+
+    با urllib.parse تجزیه می‌شود تا پسوردهای با نویسه‌های خاص (percent-encoded،
+    شامل @ یا :) و پارامترهای اتصال مثل sslmode=... درست خوانده شوند؛
+    کوئری‌استرینگ عمداً نادیده گرفته می‌شود (بخشی از نام دیتابیس نمی‌شود).
+    """
+    parts = urlsplit((url or "").strip())
+    if not parts.scheme or not parts.hostname:
+        raise ValueError("DATABASE_URL نامعتبر است (scheme/host قابل خواندن نیست).")
+    db = unquote((parts.path or "").lstrip("/"))
+    if not db:
+        raise ValueError("DATABASE_URL نامعتبر است (نام دیتابیس خالی است).")
+    try:
+        port = str(parts.port or 5432)
+    except ValueError:
+        raise ValueError("DATABASE_URL نامعتبر است (پورت نامعتبر است).") from None
+    user = unquote(parts.username or "")
+    password = unquote(parts.password or "")
+    host = parts.hostname or "localhost"
+    return user, password, host, port, db
 
 
 async def auto_backup_if_due(bot) -> bool:
-    """بک‌آپ روزانه pg_dump و ارسال به کانال تلگرامی — نیازمند pg_dump روی سرور."""
+    """بک‌آپ روزانه pg_dump و ارسال به کانال تلگرامی — نیازمند pg_dump روی سرور.
+
+    [5-INT-b / 5-G14-e] ساعتِ بک‌آپ (AUTO_BACKUP_HOUR منظورِ اپراتور ~۳ بامداد
+    محلی است) و کلیدِ dedupe روزانه بر پایه‌ی تهران‌اند، نه UTC.
+    """
     if not settings.auto_backup_enabled or not settings.auto_backup_chat_id:
         return False
-    now = datetime.now(timezone.utc)
+    now_tehran = _tehran_now()
     state = _load_state()
-    if state.get("last_backup") == now.date().isoformat():
+    if state.get("last_backup") == now_tehran.date().isoformat():
         return False
-    if now.hour < settings.auto_backup_hour:
+    if now_tehran.hour < settings.auto_backup_hour:
         return False
+    now = datetime.now(timezone.utc)  # فقط برای نام فایل/کپشن (با برچسب UTC)
     try:
         user, password, host, port, db = _parse_db_url(settings.database_url)
         with tempfile.TemporaryDirectory() as tmp:
             out = str(Path(tmp) / f"cinemavault_{now.strftime('%Y%m%d_%H%M')}.dump")
             env = dict(os.environ, PGPASSWORD=password)
-            result = subprocess.run(
+            # [P1-19/بک‌آپ] اجرای pg_dump در thread جدا (asyncio.to_thread) تا رویدادلوپ
+            # تا ۹۰۰ ثانیه قفل نشود؛ PGPASSWORD در env و timeout=900 دقیقاً مثل قبل حفظ شده‌اند.
+            result = await asyncio.to_thread(
+                subprocess.run,
                 ["pg_dump", "-h", host, "-p", port, "-U", user, "-Fc", "-f", out, db],
                 env=env,
                 capture_output=True,
@@ -456,7 +561,7 @@ async def auto_backup_if_due(bot) -> bool:
                 FSInputFile(out),
                 caption=f"💾 بک‌آپ خودکار دیتابیس — {now.strftime('%Y-%m-%d %H:%M')} UTC",
             )
-        state["last_backup"] = now.date().isoformat()
+        state["last_backup"] = now_tehran.date().isoformat()
         _save_state(state)
         return True
     except FileNotFoundError:

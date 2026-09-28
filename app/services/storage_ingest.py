@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 from aiogram.types import Message
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db.models import StorageFile, StorageProvider
 
@@ -61,20 +63,35 @@ async def ingest_storage_message(session, message: Message):
     if existing:
         return existing
 
-    storage = StorageFile(
-        provider_id=provider.id,
-        chat_id=message.chat.id,
-        message_id=message.message_id,
-        file_id=file_id,
-        file_unique_key=file_unique_id,
-        filename=filename,
-        mime_type=mime_type,
-        size_bytes=size_bytes,
-        status="READY",
-        storage_scope="PRODUCTION",
-        verified_at=datetime.now(timezone.utc),
-        extra_data=media_metadata,
+    # SELECT-then-INSERT race on uq_storage_files_provider_unique: two
+    # concurrent ingests of the same file both passed the pre-SELECT above.
+    # INSERT ... ON CONFLICT DO NOTHING makes exactly one row win (if the
+    # conflicting txn is still open, this statement waits on the unique index
+    # and skips once it commits), then we re-SELECT the surviving row so both
+    # callers observe the same StorageFile instead of one crashing with an
+    # uncaught IntegrityError. Dedupe semantics are unchanged.
+    await session.execute(
+        pg_insert(StorageFile).values(
+            {
+                StorageFile.id: uuid.uuid4(),
+                StorageFile.provider_id: provider.id,
+                StorageFile.chat_id: message.chat.id,
+                StorageFile.message_id: message.message_id,
+                StorageFile.file_id: file_id,
+                StorageFile.file_unique_key: file_unique_id,
+                StorageFile.filename: filename,
+                StorageFile.mime_type: mime_type,
+                StorageFile.size_bytes: size_bytes,
+                StorageFile.status: "READY",
+                StorageFile.storage_scope: "PRODUCTION",
+                StorageFile.verified_at: datetime.now(timezone.utc),
+                StorageFile.extra_data: media_metadata,
+            }
+        ).on_conflict_do_nothing(constraint="uq_storage_files_provider_unique")
     )
-    session.add(storage)
-    await session.flush()
-    return storage
+    return await session.scalar(
+        select(StorageFile).where(
+            StorageFile.provider_id == provider.id,
+            StorageFile.file_unique_key == file_unique_id,
+        )
+    )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hmac
+import logging
 import time
 
 from fastapi import FastAPI, HTTPException, Request
@@ -18,24 +20,45 @@ from app.api.telegram_webhook import router as telegram_webhook_router
 from app.core.brand import BRAND_NAME_FA
 from app.core.config import settings, validate_settings
 from app.core.logging import configure_logging
-from app.db.models import User
 from app.db.session import get_session
 from app.runtime.db import session_scope
 from app.services.heartbeats import heartbeat
 
 configure_logging()
 
+logger = logging.getLogger("app.api.main")
+
 _ready_cache: dict = {"value": None, "at": 0.0}
 
+# [P1-12] در محیط عملیاتی، مستندات تعاملی و اسکیمای OpenAPI غیرفعال می‌شوند.
+_is_production = settings.app_env == "production"
 app = FastAPI(
     title=BRAND_NAME_FA,
     version="1.0.0",
-    docs_url="/docs" if settings.app_env != "production" else None,
-    redoc_url="/redoc" if settings.app_env != "production" else None,
+    docs_url=None if _is_production else "/docs",
+    redoc_url=None if _is_production else "/redoc",
+    openapi_url=None if _is_production else "/openapi.json",
 )
 app.state.settings = settings
 if settings.allowed_hosts:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts))
+elif _is_production:
+    # [P1-12/P1-20] اگر ALLOWED_HOSTS در production تنظیم نشده باشد، استارت‌آپ
+    # نباید کرش کند (پنل باید بالا بماند)؛ در عوض یک سیاست محافظه‌کار فقط-لوکال‌هاست
+    # نصب می‌شود و هشدار واضح ثبت می‌گردد تا اپراتور آن را اصلاح کند.
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["localhost", "127.0.0.1"],
+    )
+    logger.warning("=" * 72)
+    logger.warning(
+        "SECURITY WARNING: ALLOWED_HOSTS is NOT set while APP_ENV=production. "
+        "TrustedHostMiddleware was installed with conservative defaults "
+        "['localhost', '127.0.0.1'] — external hostnames will be rejected with 400 "
+        "until you set ALLOWED_HOSTS (comma-separated public hostnames) in .env "
+        "and restart the service."
+    )
+    logger.warning("=" * 72)
 
 
 @app.on_event("startup")
@@ -66,6 +89,24 @@ async def shutdown():
         pass
 
 
+# [P1-12] CSP سازگار با پنل ادمین (app/api/templates/admin.html): پنل فقط فونت را
+# از fonts.googleapis.com (CSS) و fonts.gstatic.com (فایل فونت) بارگذاری می‌کند و
+# اسکریپت/استایل داخلی دارد؛ پیوندهای winapay.io لینک ناوبری هستند و مشمول CSP
+# منابع نمی‌شوند. همین CSP برای صفحه پرداخت (payments.py) نیز بی‌ضرر است.
+_CSP_HEADER = (
+    "default-src 'self'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src https://fonts.gstatic.com; "
+    "script-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'"
+)
+
+# مسیرهای مستندات FastAPI (فقط غیر-production فعال‌اند) اسکریپت/استایل از
+# cdn.jsdelivr.net بارگذاری می‌کنند؛ CSP پنل را روی آن‌ها اعمال نمی‌کنیم.
+_CSP_EXEMPT_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
+
+
 @app.middleware("http")
 async def request_context(request: Request, call_next):
     import time
@@ -80,6 +121,8 @@ async def request_context(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if (response.headers.get("content-type") or "").lower().startswith("text/html") and request.url.path not in _CSP_EXEMPT_PATHS:
+        response.headers["Content-Security-Policy"] = _CSP_HEADER
     if settings.app_env == "production":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["X-Response-Time-ms"] = f"{(time.perf_counter() - started) * 1000:.1f}"
@@ -129,15 +172,9 @@ async def health_live():
     return {"status": "LIVE", "service": BRAND_NAME_FA}
 
 
-@app.get("/health/ready", include_in_schema=False)
-async def health_ready():
+async def _compute_ready_components() -> dict[str, bool]:
     # نتیجه برای ۳۰ ثانیه کش می‌شود تا این مسیر عمومی به تقویت‌کننده فراخوانی‌های
     # خروجی (get_me / Redis ping) تبدیل نشود.
-    now = time.monotonic()
-    cached = _ready_cache.get("value")
-    if cached is not None and now - _ready_cache.get("at", 0.0) < 30:
-        return cached
-
     db_ok = False
     redis_ok = False
     bot_ok = False
@@ -189,24 +226,54 @@ async def health_ready():
     else:
         storage_ok = True
 
-    ready = db_ok and redis_ok and bot_ok and storage_ok
-    payload = {
-        "status": "READY" if ready else "DEGRADED",
-        "database": "OK" if db_ok else "ERROR",
-        "redis": "OK" if redis_ok else "ERROR",
-        "telegram": "OK" if bot_ok else "ERROR",
-        "storage": "OK" if storage_ok else "ERROR",
-    }
-    _ready_cache["value"] = payload
-    _ready_cache["at"] = now
+    return {"database": db_ok, "redis": redis_ok, "telegram": bot_ok, "storage": storage_ok}
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def health_ready(request: Request, detail: bool = False):
+    now = time.monotonic()
+    components = _ready_cache.get("value")
+    if components is None or now - _ready_cache.get("at", 0.0) >= 30:
+        components = await _compute_ready_components()
+        _ready_cache["value"] = components
+        _ready_cache["at"] = now
+
+    # [P1-12] payload عمومی فقط وضعیت کلی را برمی‌گرداند؛ توپولوژی زیرساخت
+    # (database/redis/telegram/storage) فقط با توکن ادمین و ?detail=1 افشا می‌شود.
+    payload = {"status": "READY" if all(components.values()) else "DEGRADED"}
+    if detail and _admin_token_ok(request):
+        payload.update({name: ("OK" if ok else "ERROR") for name, ok in components.items()})
     return payload
 
 
 @app.get("/health/config", include_in_schema=False)
-async def health_config():
+async def health_config(request: Request):
+    # [P1-12] بدون توکن ادمین فقط نتیجه بولی و تعداد مشکلات برگردد؛ رشته‌های
+    # problems (وضعیت BOT_TOKEN/ADMIN_API_TOKEN/...) فقط با توکن ادمین.
     problems = validate_settings(strict=False)
-    return {
-        "environment": settings.app_env,
+    payload = {
         "valid": not problems,
-        "problems": problems,
+        "problems_count": len(problems),
     }
+    if _admin_token_ok(request):
+        payload["environment"] = settings.app_env
+        payload["problems"] = problems
+    return payload
+
+
+def _admin_token_ok(request: Request) -> bool:
+    """بررسی سبک توکن ادمین (الگوی همان constant-time مقایسه در app/api/admin_auth.py)
+
+    برخلاف admin_gate خطا raise نمی‌کند؛ فقط True/False می‌دهد تا مسیرهای سلامت
+    بتوانند بدون توکن، پاسخ حداقلی برگردانند.
+    """
+    expected = settings.admin_api_token
+    if not expected:
+        return False
+    header = request.headers.get("Authorization", "")
+    if not header.lower().startswith("bearer "):
+        return False
+    provided = header[7:].strip()
+    if not provided:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))

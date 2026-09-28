@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
+from pathlib import Path
 
-from aiogram import Bot
+# Deployment docs run this as a direct path (`python scripts/set_webhook.py`);
+# bootstrap the repo root so `import app` works regardless of invocation.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from dotenv import load_dotenv
 
+from app.bot.session import make_bot
 from app.core.config import settings, validate_settings
 
 
@@ -19,7 +25,10 @@ async def main() -> None:
     if not settings.bot_token:
         raise SystemExit("BOT_TOKEN is not configured.")
 
-    bot = Bot(settings.bot_token)
+    # make_bot() is the central factory (app/bot/session.py): it honors
+    # TELEGRAM_PROXY_URL so webhook setup also works behind blocked Telegram,
+    # same Bot lifecycle as before (session closed in the finally block below).
+    bot = make_bot()
     try:
         if args.delete:
             await bot.delete_webhook(drop_pending_updates=False)

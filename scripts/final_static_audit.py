@@ -126,10 +126,58 @@ def migration_problems() -> list[str]:
     return problems
 
 
+# Secret-shape patterns scanned over the active tree (see secret_problems).
+BOT_TOKEN_RE = re.compile(r"\b\d{6,10}:[A-Za-z0-9_-]{25,}\b")
+CREDENTIALED_DB_URL_RE = re.compile(r"(postgres|postgresql)(\+\w+)?://[^/\s:]+:[^@\s]+@")
+LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{40,}\b")
+
+# [INT-c] Placeholder allowlist for the credentialed-db-url rule: lines that
+# only ever contain these known placeholder hosts/credentials are templates,
+# not secrets. ("//user:pass@host" covers the generic docstring example form.)
+PLACEHOLDER_DB_CREDENTIAL_RE = re.compile(
+    r"CHANGE_ME|example\.test|YOUR_|REPLACE_WITH|//user:pass@host\b"
+)
+
+# Per-pattern scan scope:
+#   "all"     -> every scanned text file
+#   "py-only" -> only *.py sources. The hex-40 rule is scoped to *.py because
+#                docs/ carries SHA-256 release manifests (one 64-hex hash per
+#                line) that are integrity data, not secrets.
+SECRET_PATTERNS = [
+    ("bot-token", BOT_TOKEN_RE, "all"),
+    ("credentialed-db-url", CREDENTIALED_DB_URL_RE, "all"),
+    ("hex-40-plus", LONG_HEX_RE, "py-only"),
+]
+
+
 def secret_problems() -> list[str]:
-    # Runtime dotenv files belong to the deployment environment and are intentionally
-    # excluded from this source/package audit. The release ZIP contains only .env.example.
-    return []
+    """Scan the active tree for secret-shaped strings.
+
+    Runtime dotenv files belong to the deployment environment and are
+    intentionally excluded from this source/package audit: every file named
+    .env* (including .env.example, which is a placeholder template, not a
+    secret store) is skipped. Returns lines formatted as "file:line: pattern".
+    """
+    problems: list[str] = []
+    for path in active_files():
+        if path.name.startswith(".env"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError):
+            continue  # binary/undecodable file - nothing to scan as text
+        rel = path.relative_to(ROOT)
+        is_py = path.suffix == ".py"
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            for label, pattern, scope in SECRET_PATTERNS:
+                if scope == "py-only" and not is_py:
+                    continue
+                if not pattern.search(line):
+                    continue
+                if label == "credentialed-db-url" and PLACEHOLDER_DB_CREDENTIAL_RE.search(line):
+                    continue  # placeholder host/credentials, not a real secret
+                problems.append(f"{rel}:{lineno}: {label}")
+    return problems
 
 
 def key_file_problems() -> list[str]:

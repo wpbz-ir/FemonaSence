@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -55,7 +56,14 @@ async def claim_notification_job(session, *, worker_id: str):
 
 async def render_notification(session, *, job_id, user_id, notification_type: str) -> str:
     user = await session.get(User, user_id)
-    name = ((user.first_name if user else None) or (user.username if user else None) or "کاربر").strip()
+    raw_name = ((user.first_name if user else None) or (user.username if user else None) or "کاربر").strip()
+    # [HTML-escape] first_name/username هر دو ورودیِ کنترل‌شده‌ی کاربرند و خروجی
+    # این تابع با parse_mode=HTML ارسال می‌شود (پیش‌فرض make_bot). escape در
+    # نقطه‌ی رندر انجام می‌شود تا هر دو منبع (first_name/username) و هر دو مسیر
+    # قالب (DB template یا DEFAULT_MESSAGES) یک‌جا پوشش داده شوند — بدون تزریق
+    # HTML یا شکستن parse mode با نامی مثل "<b>x</b> & <i>". quote=False چون
+    # نام فقط در متن/تگ‌های متنی می‌نشیند، نه در مقدار attribute.
+    name = html.escape(raw_name, quote=False)
     template = await session.scalar(
         text(
             """
@@ -120,27 +128,41 @@ async def mark_notification_failed(session, *, job, worker_id: str, error: str, 
         )
     )
     attempts = int(job["attempts"] or 0)
+    # [INT-c] Two STATIC branches instead of an f-string SQL: run_at is now a
+    # hardcoded literal inside each branch (never interpolated), so the SQL text
+    # is fully static and the only parameters are bound values.
     if attempts >= max_attempts:
-        status = "FAILED"
-        run_at = "CURRENT_TIMESTAMP"
+        await session.execute(
+            text(
+                """
+                UPDATE notification_jobs
+                SET status='FAILED',
+                    run_at=CURRENT_TIMESTAMP,
+                    locked_by=NULL,
+                    locked_at=NULL,
+                    last_error=:error,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=:id AND locked_by=:worker
+                """
+            ),
+            {"error": error[:4000], "id": job["id"], "worker": worker_id},
+        )
     else:
-        status = "PENDING"
-        run_at = "CURRENT_TIMESTAMP + INTERVAL '5 minutes'"
-    await session.execute(
-        text(
-            f"""
-            UPDATE notification_jobs
-            SET status=:status,
-                run_at={run_at},
-                locked_by=NULL,
-                locked_at=NULL,
-                last_error=:error,
-                updated_at=CURRENT_TIMESTAMP
-            WHERE id=:id AND locked_by=:worker
-            """
-        ),
-        {"status": status, "error": error[:4000], "id": job["id"], "worker": worker_id},
-    )
+        await session.execute(
+            text(
+                """
+                UPDATE notification_jobs
+                SET status='PENDING',
+                    run_at=CURRENT_TIMESTAMP + INTERVAL '5 minutes',
+                    locked_by=NULL,
+                    locked_at=NULL,
+                    last_error=:error,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=:id AND locked_by=:worker
+                """
+            ),
+            {"error": error[:4000], "id": job["id"], "worker": worker_id},
+        )
 
 
 async def recover_stale_notifications(session, *, stale_seconds: int = 900) -> int:

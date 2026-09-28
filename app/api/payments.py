@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -87,20 +88,83 @@ async def winapay_callback(request: Request):
     else:
         payload = {k: v for k, v in request.query_params.items()}
 
-    invoice_id = payload.get("InvoiceID", "").strip()
-    authority = payload.get("Authority", "").strip()
-    status = payload.get("PaymentStatus", "").strip()
+    # [P1-13] This endpoint is unauthenticated: rate-limit per client IP (60/min)
+    # BEFORE any DB work, so forged hammering cannot pile up webhook-event rows and
+    # provider verify round-trips (canonical P1-13 / 4-G08-c F5).
+    client_host = request.client.host if request.client else "unknown"
+    try:
+        await enforce(f"winapay-cb:{client_host}", limit=60, window_seconds=60)
+    except RateLimitExceeded:
+        return _payment_page(
+            "⚠️",
+            "تعداد درخواست‌های پرداخت بیش از حد مجاز است. لطفاً کمی بعد دوباره تلاش کنید.",
+            status_code=429,
+        )
+    except RateLimitUnavailable:
+        # Fail-open on limiter outage: blocking a genuine gateway callback because
+        # Redis is down would stall real money settlement (the start endpoint keeps
+        # its stricter 503 behaviour — there the human user can simply retry).
+        pass
+
+    # [P1-13] DataError guard: Authority/InvoiceID land in event_key (String(255))
+    # and in DB lookups — validate + truncate to 255 BEFORE any write/lookup
+    # (an oversized forged field used to raise a 500 outside the try block).
+    invoice_id = payload.get("InvoiceID", "").strip()[:255]
+    authority = payload.get("Authority", "").strip()[:255]
+    status = payload.get("PaymentStatus", "").strip()[:255]
     if not invoice_id or not authority:
         return _payment_page("❌", "اطلاعات Callback ناقص است.")
+    event_key = f"{authority}:{invoice_id}:{status}"[:255]
 
     async with session_scope() as session:
+        # [P1-13] Pre-flight txn WITHOUT row locks: the order FOR UPDATE lock now
+        # lives ONLY in settle_winapay_order's final txn, so the 30s gateway verify
+        # never runs while holding a lock (canonical P1-13 / 4-G08-c F3).
         order = await session.scalar(
-            select(Order).where(Order.order_number == invoice_id).with_for_update()
+            select(Order).where(Order.order_number == invoice_id)
         )
         if order is None:
             return _payment_page("❌", "سفارش پرداخت پیدا نشد.")
 
-        event_key = f"{authority}:{invoice_id}:{status}"
+        stored_attempt = await session.scalar(
+            select(PaymentAttempt)
+            .where(
+                PaymentAttempt.order_id == order.id,
+                PaymentAttempt.provider == "WINAPAY",
+            )
+            .order_by(PaymentAttempt.created_at.desc())
+        )
+
+        # [P1-13] Authority cross-check (defense-in-depth, BEFORE any provider
+        # verify call): settle re-verifies with the STORED attempt.authority anyway,
+        # so a callback whose Authority differs from the attempt created for this
+        # order is forged/corrupt — record the event (dedup table) as FAILED and
+        # reject with 400 without ever touching the gateway.
+        if (
+            stored_attempt is not None
+            and (stored_attempt.authority or "").strip()
+            and stored_attempt.authority != authority
+        ):
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO payment_webhook_events
+                        (id, provider, event_key, order_id, status, payload, error_message, created_at)
+                    VALUES
+                        (gen_random_uuid(), 'WINAPAY', :event_key, :order_id, 'FAILED', CAST(:payload AS jsonb), :error, CURRENT_TIMESTAMP)
+                    ON CONFLICT (provider, event_key) DO NOTHING
+                    """
+                ),
+                {
+                    "event_key": f"AUTH_MISMATCH:{authority}:{invoice_id}:{status}"[:255],
+                    "order_id": order.id,
+                    "payload": json.dumps(payload, ensure_ascii=False),
+                    "error": "Authority ارسالی با Authority ثبت‌شده برای این سفارش مطابقت ندارد.",
+                },
+            )
+            await session.commit()
+            return _payment_page("❌", "درخواست تأیید پرداخت نامعتبر است.", status_code=400)
+
         inserted = await session.execute(
             text(
                 """
@@ -112,10 +176,22 @@ async def winapay_callback(request: Request):
                 RETURNING id
                 """
             ),
-            {"event_key": event_key, "order_id": order.id, "payload": __import__("json").dumps(payload, ensure_ascii=False)},
+            {"event_key": event_key, "order_id": order.id, "payload": json.dumps(payload, ensure_ascii=False)},
         )
         event_id = inserted.scalar_one_or_none()
         if event_id is None and order.status == "PAID":
+            # [5-INT-b / 5-G13-e #3] تکراری‌بودن callback + سفارشِ PAID: رویداد قبلاً
+            # ثبت شده و تسویه انجام شده است — نباید تا ابد RECEIVED بماند؛ PROCESSED می‌شود.
+            await session.execute(
+                text(
+                    """
+                    UPDATE payment_webhook_events
+                    SET status='PROCESSED', processed_at=CURRENT_TIMESTAMP
+                    WHERE provider='WINAPAY' AND event_key=:event_key AND status <> 'PROCESSED'
+                    """
+                ),
+                {"event_key": event_key},
+            )
             await session.commit()
             return _payment_page("✅", "پرداخت شما قبلاً ثبت شده است.")
 
@@ -127,6 +203,10 @@ async def winapay_callback(request: Request):
             await session.commit()
             return _payment_page("⚠️", "پرداخت توسط درگاه تأیید نشد یا لغو شده است.")
 
+        # Commit the webhook-event bookkeeping so settle_winapay_order owns its own
+        # txn boundaries and the gateway verify runs with NO open transaction.
+        await session.commit()
+
         try:
             payment = await settle_winapay_order(
                 session,
@@ -137,6 +217,11 @@ async def winapay_callback(request: Request):
             # [P0-8] Provider verify errors: persist the PaymentAttempt as FAILED,
             # mark the webhook event FAILED, then answer 502 so the gateway retries
             # (webhook event dedup keeps retries idempotent).
+            # [P1-13] settle may raise mid-transaction: roll the partial txn back
+            # first so this session is reusable (otherwise PendingRollbackError
+            # would turn the curated 502 into an unhandled 500). The webhook event
+            # row is already committed above, so the FAILED update still lands.
+            await session.rollback()
             failed_attempt = await session.scalar(
                 select(PaymentAttempt)
                 .where(
@@ -162,10 +247,21 @@ async def winapay_callback(request: Request):
             ) from exc
 
         if event_id:
-            await session.execute(
-                text("UPDATE payment_webhook_events SET status='PROCESSED', processed_at=CURRENT_TIMESTAMP WHERE id=:id"),
-                {"id": event_id},
-            )
+            if payment is not None:
+                await session.execute(
+                    text("UPDATE payment_webhook_events SET status='PROCESSED', processed_at=CURRENT_TIMESTAMP WHERE id=:id"),
+                    {"id": event_id},
+                )
+            else:
+                # [5-INT-b / 5-G13-e #3] settle None برگردانده (تأیید درگاه ناموفق /
+                # عدم تطابق مبلغ) → رویداد PROCESSED نمی‌شود؛ FAILED ثبت می‌شود تا
+                # state machine رویدادها صادق بماند و replay بعدی بر اساس FAILED انجام شود.
+                await session.execute(
+                    text(
+                        "UPDATE payment_webhook_events SET status='FAILED', error_message=:error, processed_at=CURRENT_TIMESTAMP WHERE id=:id"
+                    ),
+                    {"id": event_id, "error": "settle_winapay_order نتیجه‌ای برنگرداند (تأیید ناموفق یا مبلغ مغایر)."[:4000]},
+                )
         await session.commit()
 
     if payment:
@@ -173,8 +269,9 @@ async def winapay_callback(request: Request):
     return _payment_page("⚠️", "تأیید پرداخت ناموفق بود.")
 
 
-def _payment_page(icon: str, message: str) -> HTMLResponse:
+def _payment_page(icon: str, message: str, *, status_code: int = 200) -> HTMLResponse:
     safe = html.escape(message)
     return HTMLResponse(
-        f"""<!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>فمونا سنس</title><style>body{{font-family:Tahoma,Arial;background:#0b1020;color:#fff;display:grid;place-items:center;min-height:100vh;margin:0}}.box{{max-width:560px;padding:32px;background:#141d31;border:1px solid #2a3a5c;border-radius:20px;text-align:center}}.i{{font-size:48px}}</style></head><body><div class='box'><div class='i'>{icon}</div><h2>فمونا سنس</h2><p>{safe}</p><p>می‌توانید به ربات بازگردید.</p></div></body></html>"""
+        f"""<!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>فمونا سنس</title><style>body{{font-family:Tahoma,Arial;background:#0b1020;color:#fff;display:grid;place-items:center;min-height:100vh;margin:0}}.box{{max-width:560px;padding:32px;background:#141d31;border:1px solid #2a3a5c;border-radius:20px;text-align:center}}.i{{font-size:48px}}</style></head><body><div class='box'><div class='i'>{icon}</div><h2>فمونا سنس</h2><p>{safe}</p><p>می‌توانید به ربات بازگردید.</p></div></body></html>""",
+        status_code=status_code,
     )

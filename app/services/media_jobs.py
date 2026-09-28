@@ -13,6 +13,20 @@ def _now():
 
 
 async def recover_stale_jobs(session, *, lease_seconds: int) -> int:
+    """Reconcile jobs whose workers died, plus cancel-flagged stragglers.
+
+    1. Stale RUNNING with attempts left -> RETRY (original behavior), but only
+       while attempts < max_attempts so an endlessly worker-killing job cannot
+       be re-queued forever.
+    2. Stale RUNNING with the attempts budget exhausted -> FAILED (terminal).
+    3. RETRY jobs carrying cancel_requested=TRUE are skipped by claim_job
+       forever; honour the operator cancel by marking them FAILED.
+
+    Returns the total number of reconciled rows.
+    """
+    total = 0
+
+    # 1) Stale lease with attempts budget remaining -> back to the queue.
     result = await session.execute(
         text(
             """
@@ -26,12 +40,58 @@ async def recover_stale_jobs(session, *, lease_seconds: int) -> int:
                 error_code = 'STALE_LEASE',
                 error_message = 'Worker lease expired; job returned to queue.'
             WHERE status = 'RUNNING'
+              AND attempts < max_attempts
               AND COALESCE(heartbeat_at, locked_at) < CURRENT_TIMESTAMP - make_interval(secs => :lease_seconds)
             """
         ),
         {"lease_seconds": int(lease_seconds)},
     )
-    return int(result.rowcount or 0)
+    total += int(result.rowcount or 0)
+
+    # 2) Stale lease with attempts exhausted -> FAILED so it terminates.
+    result = await session.execute(
+        text(
+            """
+            UPDATE media_jobs
+            SET status = 'FAILED',
+                finished_at = CURRENT_TIMESTAMP,
+                locked_by = NULL,
+                locked_at = NULL,
+                heartbeat_at = NULL,
+                error_code = 'STALE_LEASE',
+                error_message = 'Worker lease expired and attempts budget exhausted; job marked FAILED.',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'RUNNING'
+              AND attempts >= max_attempts
+              AND COALESCE(heartbeat_at, locked_at) < CURRENT_TIMESTAMP - make_interval(secs => :lease_seconds)
+            """
+        ),
+        {"lease_seconds": int(lease_seconds)},
+    )
+    total += int(result.rowcount or 0)
+
+    # 3) Operator cancel that outlived its worker: claim_job filters
+    #    cancel_requested = FALSE, so a RETRY row with a pending cancel
+    #    request would be skipped forever. Respect the cancel -> FAILED.
+    result = await session.execute(
+        text(
+            """
+            UPDATE media_jobs
+            SET status = 'FAILED',
+                finished_at = CURRENT_TIMESTAMP,
+                locked_by = NULL,
+                locked_at = NULL,
+                heartbeat_at = NULL,
+                error_code = 'CANCELLED_BY_OPERATOR',
+                error_message = 'Operator cancel requested; job marked FAILED instead of retrying.',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'RETRY'
+              AND cancel_requested = TRUE
+            """
+        ),
+    )
+    total += int(result.rowcount or 0)
+    return total
 
 
 async def claim_job(session, *, worker_id: str):
@@ -44,6 +104,7 @@ async def claim_job(session, *, worker_id: str):
                     FROM media_jobs
                     WHERE status IN ('QUEUED', 'RETRY')
                       AND cancel_requested = FALSE
+                      AND attempts < max_attempts
                       AND available_at <= CURRENT_TIMESTAMP
                     ORDER BY priority DESC, created_at ASC
                     FOR UPDATE SKIP LOCKED
@@ -105,7 +166,7 @@ async def append_event(session, *, job_id, event_type: str, message: str | None 
         {
             "job_id": job_id,
             "event_type": event_type,
-            "message": message,
+            "message": message[:4000] if message is not None else None,
             "data": json.dumps(data or {}, ensure_ascii=False),
         },
     )
@@ -195,42 +256,45 @@ async def enqueue_transcode(
             ON CONFLICT (idempotency_key)
             DO UPDATE SET
                 status = CASE
-                    WHEN media_jobs.status IN ('FAILED', 'CANCELLED') THEN 'QUEUED'
+                    WHEN media_jobs.status = 'FAILED' THEN 'QUEUED'
                     ELSE media_jobs.status
                 END,
                 attempts = CASE
-                    WHEN media_jobs.status IN ('FAILED', 'CANCELLED') THEN 0
+                    WHEN media_jobs.status = 'FAILED' THEN 0
                     ELSE media_jobs.attempts
                 END,
                 available_at = CASE
-                    WHEN media_jobs.status IN ('FAILED', 'CANCELLED') THEN CURRENT_TIMESTAMP
+                    WHEN media_jobs.status = 'FAILED' THEN CURRENT_TIMESTAMP
                     ELSE media_jobs.available_at
                 END,
                 locked_by = CASE
-                    WHEN media_jobs.status IN ('FAILED', 'CANCELLED') THEN NULL
+                    WHEN media_jobs.status = 'FAILED' THEN NULL
                     ELSE media_jobs.locked_by
                 END,
                 locked_at = CASE
-                    WHEN media_jobs.status IN ('FAILED', 'CANCELLED') THEN NULL
+                    WHEN media_jobs.status = 'FAILED' THEN NULL
                     ELSE media_jobs.locked_at
                 END,
                 heartbeat_at = CASE
-                    WHEN media_jobs.status IN ('FAILED', 'CANCELLED') THEN NULL
+                    WHEN media_jobs.status = 'FAILED' THEN NULL
                     ELSE media_jobs.heartbeat_at
                 END,
                 finished_at = CASE
-                    WHEN media_jobs.status IN ('FAILED', 'CANCELLED') THEN NULL
+                    WHEN media_jobs.status = 'FAILED' THEN NULL
                     ELSE media_jobs.finished_at
                 END,
                 error_code = CASE
-                    WHEN media_jobs.status IN ('FAILED', 'CANCELLED') THEN NULL
+                    WHEN media_jobs.status = 'FAILED' THEN NULL
                     ELSE media_jobs.error_code
                 END,
                 error_message = CASE
-                    WHEN media_jobs.status IN ('FAILED', 'CANCELLED') THEN NULL
+                    WHEN media_jobs.status = 'FAILED' THEN NULL
                     ELSE media_jobs.error_message
                 END,
-                cancel_requested = FALSE,
+                cancel_requested = CASE
+                    WHEN media_jobs.status = 'FAILED' THEN FALSE
+                    ELSE media_jobs.cancel_requested
+                END,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id, status
             """

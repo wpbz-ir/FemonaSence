@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.core.database import async_database_url
+from app.core.database import async_engine_kwargs_from_url
 from app.core.media_config import load_media_settings
 from app.services.media_jobs import recover_stale_jobs
 
@@ -14,9 +14,10 @@ from app.services.media_jobs import recover_stale_jobs
 async def main() -> None:
     load_dotenv()
     settings = load_media_settings()
+    # [INT-c/M3] Same Neon pooler guard (statement_cache_size=0) as the app
+    # engine, via the shared helper in app/core/database.py.
     engine = create_async_engine(
-        async_database_url(os.getenv("DATABASE_URL", "")),
-        pool_pre_ping=True,
+        **async_engine_kwargs_from_url(os.getenv("DATABASE_URL", "")),
     )
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     try:

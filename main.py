@@ -38,23 +38,44 @@ async def setup_commands(bot: Bot) -> None:
 
 
 async def register_error_handler(dp) -> None:
-    """خطاهای هندلرها را ثبت می‌کند و به کاربر پیام فارسی نشان می‌دهد."""
+    """خطاهای هندلرها را ثبت می‌کند و به کاربر پیام فارسی نشان می‌دهد.
+
+    [5-INT-b] در aiogram 3، رویدادِ dp.errors یک ErrorEvent است (دارای
+    update و exception) و خودش نه message دارد و نه bot — نسخه‌ی قبلی با
+    event.bot/event.message مرده بود (AttributeError → except بی‌صدا).
+    حالا: chat از event.update استخراج می‌شود (message یا
+    callback_query.message) و bot از update (کانتکستِ aiogram) یا
+    workflow_data گرفته می‌شود. ارسالِ پیامِ فارسی کاملاً محافظت‌شده است و
+    هرگز traceback به کاربر نشان داده نمی‌شود.
+    """
 
     @dp.errors()
     async def on_error(event, **_kwargs):
-        logger.exception("خطای هندلر ربات: %r", event)
+        exception = getattr(event, "exception", None)
+        logger.error("خطای هندلر ربات", exc_info=exception)
         try:
-            bot = dp.bot or event.bot
-            chat_id = getattr(getattr(event, "message", None), "chat", None)
-            chat_id = chat_id.id if chat_id else getattr(event, "from_user", None)
-            chat_id = chat_id.id if hasattr(chat_id, "id") else chat_id
-            if chat_id:
+            update = getattr(event, "update", None)
+            message = getattr(update, "message", None) or getattr(update, "edited_message", None)
+            if message is None:
+                callback_query = getattr(update, "callback_query", None)
+                message = getattr(callback_query, "message", None) if callback_query else None
+            chat = getattr(message, "chat", None)
+            bot = None
+            try:
+                # aiogram 3 رخدادِ در جریان را به bot می‌بندد (update.bot).
+                bot = getattr(update, "bot", None)
+            except Exception:
+                bot = None
+            if bot is None:
+                # در run_polling هر تلاش، باتِ جاری در workflow_data ثبت می‌شود.
+                bot = dp.workflow_data.get("bot")
+            if chat is not None and bot is not None:
                 await bot.send_message(
-                    chat_id,
+                    chat.id,
                     "⚠️ خطایی رخ داد. لطفاً دوباره تلاش کنید یا از /start استفاده کنید.",
                 )
         except Exception:
-            pass
+            logger.warning("ارسال پیام خطا به کاربر ناموفق بود", exc_info=True)
         return True
 
 

@@ -3,11 +3,19 @@ from __future__ import annotations
 import os
 
 from app.core.config import settings
+from app.core.media_config import validate_bot_api_base_url
 from app.services.telegram_media import TelegramMediaClient, TelegramMediaError
 
 
 async def check_telegram_storage() -> dict:
-    base_url = os.getenv("TELEGRAM_BOT_API_BASE_URL", "https://api.telegram.org").rstrip("/")
+    # [INT-c] Same scheme guard as the media worker (shared check in
+    # app/core/media_config.py): https only, or http on localhost/127.0.0.1/::1
+    # for a local Bot API server. Invalid values log an ERROR and fall back to
+    # the official cloud URL instead of dying later with aiohttp InvalidURL
+    # inside the health check.
+    base_url = validate_bot_api_base_url(
+        os.getenv("TELEGRAM_BOT_API_BASE_URL", "https://api.telegram.org")
+    )
     chat_id = settings.production_storage_chat_id or os.getenv("TELEGRAM_STORAGE_CHAT_ID")
     client = TelegramMediaClient(token=settings.bot_token, base_url=base_url)
     if not chat_id:

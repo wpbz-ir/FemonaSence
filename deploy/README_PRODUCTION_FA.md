@@ -80,6 +80,8 @@ PUBLIC_BASE_URL=https://YOUR-DOMAIN.example
 ALLOWED_HOSTS=YOUR-DOMAIN.example
 TELEGRAM_MODE=webhook
 TELEGRAM_WEBHOOK_SECRET=...
+# در صورت فیلتر/عدم دسترسی به api.telegram.org — خالی بماند اگر پراکسی لازم نیست
+TELEGRAM_PROXY_URL=socks5://127.0.0.1:10808
 RUN_MAINTENANCE_IN_BOT=0
 RUN_NOTIFICATIONS_IN_BOT=0
 TELEGRAM_STORAGE_REQUIRED=1
@@ -168,6 +170,14 @@ powershell -ExecutionPolicy Bypass -File .\deploy\register_tasks.ps1
   `[BOT] Skipped: TELEGRAM_MODE not set (set TELEGRAM_MODE=polling in .env to enable)`
 
 خروج شدن Bot با خطا غیرحیاتی (non-fatal) است؛ پنل و Workerها آنلاین می‌مانند و اسکریپت `WINDOWS_PROCESS_STARTUP_OK (BOT failed - panel is online, see hints above)` چاپ می‌کند. برای دیدن `TELEGRAM_MODE` و `START_BOT` پیشنهادی به `.env.example` ریشه پروژه مراجعه کنید.
+
+#### پراکسی تلگرام با `TELEGRAM_PROXY_URL`
+
+اگر سرور به `api.telegram.org` دسترسی ندارد (خطای `getaddrinfo failed` در لاگ Bot)، متغیر `TELEGRAM_PROXY_URL` را در `.env` تنظیم کنید؛ تمام ترافیک تلگرام (Bot، Worker اعلان‌ها، ارسال رسانه) از همین یک تنظیم عبور می‌کند:
+
+- مثال: `TELEGRAM_PROXY_URL=socks5://127.0.0.1:10808` یا `TELEGRAM_PROXY_URL=http://127.0.0.1:10809`
+- طرح‌های مجاز: `socks5` / `socks5h` / `socks4` / `http` / `https`
+- اگر خالی بماند، اتصال مستقیم استفاده می‌شود؛ اعتبار این مقدار در استارتاپ سنجیده می‌شود و مقدار نامعتبر در production فرایند را متوقف می‌کند.
 
 ### 11. بررسی
 ```powershell

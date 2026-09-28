@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -47,6 +48,7 @@ from app.services.admin_ops import (
     set_job_priority,
 )
 from app.services.audit import record_admin_action
+from app.services.coupons import normalize_coupon_code
 from app.services.text_normalization import repair_mojibake
 from app.services.content_admin import (
     attach_storage_file,
@@ -1012,10 +1014,30 @@ async def coupons_create(payload: CouponCreate, request: Request):
     value = payload.value
     if payload.discount_type == "PERCENT" and value > Decimal("100"):
         raise HTTPException(status_code=422, detail="درصد تخفیف نمی‌تواند بیشتر از 100 باشد.")
+    # [P1-13] Sanity cap on fixed-Toman coupons (admin input is still bounded).
+    if payload.discount_type == "FIXED_TOMAN" and value > Decimal("10000000000"):
+        raise HTTPException(status_code=422, detail="سقف تخفیف مبلغ ثابت 10000000000 تومان است.")
+    # [P1-13] Cap the target-user list so one request cannot balloon into an
+    # unbounded CouponTargetUser insert loop.
+    if len(payload.telegram_user_ids) > 1000:
+        raise HTTPException(status_code=422, detail="حداکثر 1000 شناسه تلگرام برای هر کد تخفیف مجاز است.")
     if payload.valid_from and payload.valid_until and payload.valid_until <= payload.valid_from:
         raise HTTPException(status_code=422, detail="پایان اعتبار باید بعد از شروع اعتبار باشد.")
 
-    code = (payload.code or f"CP-{uuid.uuid4().hex[:8].upper()}").strip().upper()
+    # [P1-13] Normalize the code through the SAME helper the redeem path uses
+    # (app.services.coupons.normalize_coupon_code): creation used to only
+    # .strip().upper(), so codes with internal spaces were created but never
+    # matched at redeem time. Empty-after-normalization (whitespace-only input)
+    # is rejected instead of silently inserting an unredeemable row.
+    if payload.code is not None:
+        code = normalize_coupon_code(payload.code)
+        if not code:
+            raise HTTPException(status_code=422, detail="کد تخفیف نمی‌تواند خالی باشد.")
+    else:
+        # [5-INT-b / 5-G13-c #3] کد خودکار باید آنتروپی ≥ ۱۲ کاراکتر هگز داشته باشد؛
+        # قبلی uuid4().hex[:8] فقط ۳۲ بیت بود (حدس‌پذیر در سناریوی enumerate).
+        # token_hex(8) = ۱۶ کاراکتر هگز (۶۴ بیت) → CP-<16hex>.
+        code = normalize_coupon_code(f"CP-{secrets.token_hex(8).upper()}")
     async with session_scope() as session:
         exists = await session.scalar(select(func.count()).select_from(Coupon).where(Coupon.code == code))
         if exists:

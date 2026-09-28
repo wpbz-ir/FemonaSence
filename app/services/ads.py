@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db.models import AdRequest, AdSetting, User
 from app.services.text_normalization import clean_text
@@ -17,9 +18,16 @@ async def get_ad_settings(session) -> AdSetting | None:
 async def get_or_create_ad_settings(session) -> AdSetting:
     row = await get_ad_settings(session)
     if row is None:
-        row = AdSetting(singleton=True)
-        session.add(row)
-        await session.flush()
+        # RACE (ad_settings.singleton UNIQUE): دو درخواست هم‌زمان می‌توانند به اینجا
+        # برسند؛ ON CONFLICT DO NOTHING + re-select تضمین می‌کند دقیقاً یک ردیف وجود دارد.
+        await session.execute(
+            pg_insert(AdSetting)
+            .values(singleton=True)
+            .on_conflict_do_nothing(index_elements=[AdSetting.singleton])
+        )
+        row = await get_ad_settings(session)
+        if row is None:  # عملاً دست‌نیافتنی — برندهٔ تراکنش هم‌زمان باید دیده شود
+            raise RuntimeError("ad_settings row missing after upsert")
     return row
 
 
@@ -46,6 +54,19 @@ def serialize_ad_settings(row: AdSetting | None) -> dict:
 
 
 # ---------- Requests ----------
+
+# Whitelist of legal ad-request statuses + allowed transitions.
+# PENDING -> APPROVED | REJECTED; APPROVED -> PUBLISHED | REJECTED;
+# REJECTED / PUBLISHED are terminal (immutable). Re-submitting the same
+# status that is already on the row is an idempotent no-op.
+AD_REQUEST_STATUSES = frozenset({"PENDING", "APPROVED", "REJECTED", "PUBLISHED"})
+
+AD_REQUEST_TRANSITIONS: dict[str, frozenset[str]] = {
+    "PENDING": frozenset({"APPROVED", "REJECTED"}),
+    "APPROVED": frozenset({"PUBLISHED", "REJECTED"}),
+    "REJECTED": frozenset(),  # terminal
+    "PUBLISHED": frozenset(),  # terminal
+}
 
 async def create_ad_request(
     session,
@@ -111,10 +132,32 @@ async def get_ad_request(session, request_id) -> AdRequest | None:
 
 
 async def set_ad_request_status(session, request_id, *, status: str, admin_note: str | None, reviewer_user_id=None) -> AdRequest | None:
+    """Transition an ad request through the validated status machine.
+
+    Raises ValueError for an unknown status or an illegal transition
+    (terminal rows are immutable). Callers that surface this to users must
+    catch ValueError; unknown states fail closed instead of silently
+    corrupting the workflow.
+    """
+    new_status = (status or "").strip().upper()
+    if new_status not in AD_REQUEST_STATUSES:
+        raise ValueError(f"invalid ad request status: {new_status!r}")
+
     row = await session.get(AdRequest, request_id)
     if row is None:
         return None
-    row.status = status.upper()
+
+    current_status = (row.status or "").upper()
+    if current_status == new_status:
+        # Same-status re-submit: idempotent no-op, review metadata untouched.
+        return row
+
+    if new_status not in AD_REQUEST_TRANSITIONS.get(current_status, frozenset()):
+        raise ValueError(
+            f"invalid ad request status transition: {current_status} -> {new_status}"
+        )
+
+    row.status = new_status
     row.admin_note = clean_text(admin_note, 2000) if admin_note else None
     row.reviewed_at = datetime.now(timezone.utc)
     row.reviewed_by = reviewer_user_id

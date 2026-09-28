@@ -10,12 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.config import settings, validate_settings
-from app.core.database import async_database_url
-
-
-def db_url() -> str:
-    return async_database_url(settings.database_url)
-
+from app.core.database import async_engine_kwargs_from_url
 
 
 async def main() -> int:
@@ -35,7 +30,9 @@ async def main() -> int:
     print("Alembic:", (result.stdout or result.stderr).strip())
 
     db_ok = False
-    engine = create_async_engine(db_url(), pool_pre_ping=True)
+    # [INT-c/M3] Same Neon pooler guard (statement_cache_size=0) as the app
+    # engine, via the shared helper in app/core/database.py.
+    engine = create_async_engine(**async_engine_kwargs_from_url(settings.database_url))
     try:
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 import re
 import uuid
+from urllib.parse import urlsplit
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -46,6 +48,8 @@ from app.services.runtime_admin_config import load_module_settings, save_module_
 from app.services.runtime_bot_menu_config import load_bot_menu_settings, save_bot_menu_settings
 from app.services.runtime_payment_config import load_payment_config, public_payment_config, save_payment_config
 from app.services.text_normalization import repair_mojibake
+
+logger = logging.getLogger(__name__)
 
 
 class UserStatusUpdate(BaseModel):
@@ -197,6 +201,13 @@ def _fa_digits(value) -> str:
     return str(value).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
 
+def _escape_like(term: str) -> str:
+    # [P1-15-style hardening] کاربر نباید بتواند با % و _ رفتار LIKE را عوض کند؛
+    # کاراکترهای wildcard با بک‌اسلش escape می‌شوند (escape پیش‌فرض LIKE/ILIKE در
+    # PostgreSQL همان بک‌اسلش است) و مقدار همچنان به‌صورت پارامتر bound ارسال می‌شود.
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 async def _admin_actor_id(session) -> uuid.UUID | None:
     if settings.admin_user_id is None:
         return None
@@ -212,7 +223,7 @@ async def admin_users(offset: int = 0, limit: int = 50, q: str | None = None, st
         if status:
             stmt = stmt.where(User.status == status.upper())
         if q:
-            term = f"%{q.strip()}%"
+            term = f"%{_escape_like(q.strip())}%"
             conditions = [User.username.ilike(term), User.first_name.ilike(term), User.last_name.ilike(term)]
             if q.strip().isdigit():
                 conditions.append(User.telegram_user_id == int(q.strip()))
@@ -234,7 +245,7 @@ async def admin_users(offset: int = 0, limit: int = 50, q: str | None = None, st
         if status:
             total_stmt = total_stmt.where(User.status == status.upper())
         if q:
-            term = f"%{q.strip()}%"
+            term = f"%{_escape_like(q.strip())}%"
             cond = [User.username.ilike(term), User.first_name.ilike(term), User.last_name.ilike(term)]
             if q.strip().isdigit():
                 cond.append(User.telegram_user_id == int(q.strip()))
@@ -446,9 +457,11 @@ async def title_years():
 
 
 @router.get("/series", dependencies=[Depends(admin_gate)])
-async def series_list():
+async def series_list(offset: int = 0, limit: int = 100):
+    offset = max(0, min(offset, 100000))
+    limit = max(1, min(limit, 200))
     async with session_scope() as session:
-        rows = (await session.execute(select(Series, Title).join(Title, Title.id == Series.title_id).order_by(Title.title_fa.asc()))).all()
+        rows = (await session.execute(select(Series, Title).join(Title, Title.id == Series.title_id).order_by(Title.title_fa.asc()).offset(offset).limit(limit))).all()
         return [{"id": str(s.id), "title_id": str(t.id), "title_fa": repair_mojibake(t.title_fa), "total_seasons": s.total_seasons, "ongoing": s.ongoing} for s, t in rows]
 
 
@@ -479,9 +492,11 @@ async def series_update(series_id: uuid.UUID, payload: SeriesUpdate, request: Re
 
 
 @router.get("/seasons", dependencies=[Depends(admin_gate)])
-async def seasons(series_id: uuid.UUID | None = None):
+async def seasons(series_id: uuid.UUID | None = None, offset: int = 0, limit: int = 100):
+    offset = max(0, min(offset, 100000))
+    limit = max(1, min(limit, 200))
     async with session_scope() as session:
-        stmt = select(Season).order_by(Season.season_number.asc())
+        stmt = select(Season).order_by(Season.season_number.asc()).offset(offset).limit(limit)
         if series_id: stmt = stmt.where(Season.series_id == series_id)
         rows = (await session.scalars(stmt)).all()
         return [{"id": str(x.id), "series_id": str(x.series_id), "season_number": x.season_number, "title": repair_mojibake(x.title), "synopsis": repair_mojibake(x.synopsis)} for x in rows]
@@ -512,9 +527,11 @@ async def season_update(season_id: uuid.UUID, payload: SeasonUpdate, request: Re
 
 
 @router.get("/episodes", dependencies=[Depends(admin_gate)])
-async def episodes(season_id: uuid.UUID | None = None):
+async def episodes(season_id: uuid.UUID | None = None, offset: int = 0, limit: int = 100):
+    offset = max(0, min(offset, 100000))
+    limit = max(1, min(limit, 200))
     async with session_scope() as session:
-        stmt = select(Episode).order_by(Episode.episode_number.asc())
+        stmt = select(Episode).order_by(Episode.episode_number.asc()).offset(offset).limit(limit)
         if season_id: stmt = stmt.where(Episode.season_id == season_id)
         rows = (await session.scalars(stmt)).all()
         return [{"id": str(x.id), "season_id": str(x.season_id), "episode_number": x.episode_number, "title": repair_mojibake(x.title), "synopsis": repair_mojibake(x.synopsis), "runtime_minutes": x.runtime_minutes, "air_date": x.air_date.isoformat() if x.air_date else None} for x in rows]
@@ -602,10 +619,20 @@ async def title_relations(title_id: uuid.UUID):
 
 
 @router.get("/releases", dependencies=[Depends(admin_gate)])
-async def admin_releases(offset: int = 0, limit: int = 100, status: str | None = None):
+async def admin_releases(
+    offset: int = 0,
+    limit: int = 100,
+    status: str | None = None,
+    title_id: uuid.UUID | None = None,
+    episode_id: uuid.UUID | None = None,
+):
     async with session_scope() as session:
-        stmt = select(Release).order_by(Release.created_at.desc()).offset(max(0, offset)).limit(min(100, max(1, limit)))
+        stmt = select(Release).order_by(Release.created_at.desc()).offset(max(0, offset)).limit(min(200, max(1, limit)))
         if status: stmt = stmt.where(Release.status == status.upper())
+        # فیلترهای اختیاری پنل (loadPipeReleases با title_id فراخوانی می‌کند)؛
+        # FastAPI خودش قالب UUID را اعتبارسنجی می‌کند (ورودی نامعتبر → 422).
+        if title_id: stmt = stmt.where(Release.title_id == title_id)
+        if episode_id: stmt = stmt.where(Release.episode_id == episode_id)
         rows = (await session.scalars(stmt)).all()
         return [{"id": str(x.id), "title_id": str(x.title_id) if x.title_id else None, "episode_id": str(x.episode_id) if x.episode_id else None, "quality": x.quality, "language": x.language, "subtitle_type": x.subtitle_type, "label": repair_mojibake(x.label), "height": x.height, "codec_video": x.codec_video, "codec_audio": x.codec_audio, "container": x.container, "size_bytes": x.size_bytes, "status": x.status, "status_fa": _fa_status(x.status), "priority": x.priority, "pipeline_key": x.pipeline_key} for x in rows]
 
@@ -642,13 +669,30 @@ async def payment_gateway_update(payload: PaymentGatewayUpdate, request: Request
 @router.post("/payment-gateway/test", dependencies=[Depends(admin_gate)])
 async def payment_gateway_test():
     config = load_payment_config()
+    base_url = str(config.get("base_url") or "").strip()
+    parsed = urlsplit(base_url)
+    # [P1-12 hardening] آزمون اتصال فقط به میزبان رسمی درگاه (winapay.io یا میزبان
+    # WINAPAY_BASE_URL پیکربندی‌شده) اجازه می‌شود تا از این endpoint به‌عنوان
+    # پایه‌ی درخواست سمت سرور (SSRF) به مقاصد دیگر استفاده نشود.
+    allowed_hosts = {"winapay.io"}
+    configured_host = urlsplit(settings.winapay_base_url).hostname
+    if configured_host:
+        allowed_hosts.add(configured_host.lower())
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in allowed_hosts:
+        raise HTTPException(
+            status_code=422,
+            detail="آزمون اتصال فقط برای نشانی رسمی درگاه ویناپی مجاز است.",
+        )
     try:
         import httpx
         async with httpx.AsyncClient(timeout=float(config.get("timeout_seconds", 30)), follow_redirects=False) as client:
-            response = await client.get(str(config.get("base_url")))
+            response = await client.get(base_url)
         return {"reachable": True, "status_code": response.status_code, "message": "دسترسی شبکه به نشانی درگاه برقرار است."}
-    except Exception as exc:
-        return {"reachable": False, "status_code": None, "message": "دسترسی شبکه به نشانی درگاه برقرار نیست.", "diagnostic": str(exc)[:400]}
+    except Exception:
+        # [P1-12 hardening] متن خطای داخلی (diagnostic) به پاسخ برگردانده نمی‌شود؛
+        # جزئیات فقط در لاگ سامانه ثبت می‌شود.
+        logger.warning("payment gateway connectivity test failed for base_url=%s", base_url, exc_info=True)
+        return {"reachable": False, "status_code": None, "message": "دسترسی شبکه به نشانی درگاه برقرار نیست."}
 
 
 @router.get("/settings/modules", dependencies=[Depends(admin_gate)])
@@ -687,9 +731,22 @@ async def bot_menu_settings_update(payload: ModuleSettingsUpdate, request: Reque
 
 @router.get("/audit", dependencies=[Depends(admin_gate)])
 async def admin_audit(offset: int = 0, limit: int = 100):
+    offset = max(0, min(offset, 100000))
+    limit = max(1, min(limit, 200))
     async with session_scope() as session:
-        rows = (await session.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).offset(max(0, offset)).limit(min(100, max(1, limit))))).all()
-        return [{"id": str(x.id), "action": x.action, "entity_type": x.entity_type, "entity_id": str(x.entity_id) if x.entity_id else None, "created_at": x.created_at.isoformat(), "old": x.old_value, "new": x.new_value} for x in rows]
+        # [G05-e #8 / panel contract] منبع حسابرسی AdminActionLog است (کارهای
+        # record_admin_action)؛ کلیدهای old/new از details استخراج می‌شوند تا پنل
+        # (ستون‌های «مقدار قبلی/مقدار جدید») بدون تغییر کار کند.
+        rows = (await session.scalars(select(AdminActionLog).order_by(AdminActionLog.created_at.desc()).offset(offset).limit(limit))).all()
+        return [{
+            "id": str(x.id),
+            "action": x.action,
+            "entity_type": x.entity_type,
+            "entity_id": str(x.entity_id) if x.entity_id else None,
+            "created_at": x.created_at.isoformat(),
+            "old": (x.details or {}).get("old") if isinstance(x.details, dict) else None,
+            "new": (x.details or {}).get("new") if isinstance(x.details, dict) else None,
+        } for x in rows]
 
 
 @router.post("/encoding/repair", dependencies=[Depends(admin_gate)])
@@ -736,9 +793,17 @@ async def pipeline_advanced(title_id: uuid.UUID, payload: MatrixRequest, request
         source = await session.get(Release, payload.source_release_id)
         if title is None: raise HTTPException(status_code=404, detail="عنوان پیدا نشد.")
         if source is None: raise HTTPException(status_code=404, detail="نسخه مبنا پیدا نشد.")
+        # [P1-12 hardening] نسخه‌ی مبنا باید متعلق به همین عنوان در مسیر باشد؛
+        # در غیر این صورت ماتریس برای عنوان اشتباه ساخته می‌شود.
+        if source.title_id != title.id:
+            raise HTTPException(status_code=422, detail="نسخه‌ی مبنا به این عنوان تعلق ندارد.")
         try:
             run = await build_quality_matrix(session, source_release_id=source.id, requested_qualities=payload.qualities, requires_subscription=payload.requires_subscription, minimum_plan_rank=payload.minimum_plan_rank, priority=payload.priority, description=payload.description, target_language=payload.target_language, target_subtitle_type=payload.target_subtitle_type, target_codec_video=payload.target_codec_video, target_codec_audio=payload.target_codec_audio, target_container=payload.target_container, auto_publish=payload.auto_publish)
         except PipelineError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ValueError as exc:
+            # normalize_quality برای کیفیت نامعتبر ValueError می‌دهد (PipelineError
+            # زیرکلاس خودش است و بالا گرفته می‌شود) → 422 فارسی به‌جای 500.
+            raise HTTPException(status_code=422, detail="کیفیت درخواست‌شده پشتیبانی نمی‌شود.") from exc
         await record_admin_action(session, action="BUILD_ADVANCED_QUALITY_MATRIX", entity_type="pipeline", entity_id=run.id, actor_user_id=await _admin_actor_id(session), details=payload.model_dump(exclude={"source_release_id"}), **_request_meta(request))
         return {"run_id": str(run.id), "status": run.status, "settings": payload.model_dump(exclude={"source_release_id"})}

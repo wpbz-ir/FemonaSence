@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, func, or_, select, update
 
 from app.db.models import Coupon, CouponRedemption, CouponTargetUser, User
 from app.services.pricing import discounted_amount
@@ -62,6 +62,63 @@ async def _scope_ok(session, coupon: Coupon, *, user_id: UUID, plan_id: UUID) ->
     return False
 
 
+async def _count_active_redemptions(
+    session, coupon_id: UUID, now: datetime, *, user_id: UUID | None = None
+) -> int:
+    """Count coupon slots consumed: REDEEMED redemptions + still-ACTIVE holds.
+
+    [P1-13] TTL-aware quota semantics (shared by reserve_coupon and
+    preview_coupon — read-only, so preview cannot mutate): a RESERVED row stops
+    counting once it outlives RESERVATION_TTL (30 min). Expired reservations are
+    squatting garbage that reserve_coupon flips to RELEASED opportunistically
+    (_release_stale_reservations); counting them would let one user hold the last
+    slot of a scarce coupon forever by re-reserving unpaid orders. REDEEMED rows
+    always count.
+    """
+    cutoff = now - RESERVATION_TTL
+    conditions = [
+        CouponRedemption.coupon_id == coupon_id,
+        or_(
+            CouponRedemption.status == "REDEEMED",
+            and_(
+                CouponRedemption.status == "RESERVED",
+                CouponRedemption.reserved_at >= cutoff,
+            ),
+        ),
+    ]
+    if user_id is not None:
+        conditions.append(CouponRedemption.user_id == user_id)
+    return int(await session.scalar(
+        select(func.count()).select_from(CouponRedemption).where(*conditions)
+    ) or 0)
+
+
+async def _assert_coupon_usable(
+    session, coupon: Coupon, *, user_id: UUID, plan_id: UUID, now: datetime
+) -> None:
+    """[P1-13] THE single eligibility gate (validity window, scope, usage limits)
+    shared by reserve_coupon AND preview_coupon, so a preview can never promise a
+    discount that reserve/settle would later refuse (canonical P1-13 / 4-G01-c
+    finding 4). Must stay in sync with what the settle path enforces.
+
+    max_uses / per_user_limit semantics (see _count_active_redemptions): slots are
+    consumed by REDEEMED redemptions and by RESERVED holds still inside
+    RESERVATION_TTL; expired reservations never count.
+    """
+    if coupon.valid_from and coupon.valid_from > now:
+        raise ValueError("زمان شروع این کد تخفیف هنوز نرسیده است.")
+    if coupon.valid_until and coupon.valid_until < now:
+        raise ValueError("اعتبار این کد تخفیف تمام شده است.")
+    if not await _scope_ok(session, coupon, user_id=user_id, plan_id=plan_id):
+        raise ValueError("این کد تخفیف برای این کاربر یا پلن قابل استفاده نیست.")
+    used = await _count_active_redemptions(session, coupon.id, now)
+    if coupon.max_uses is not None and used >= coupon.max_uses:
+        raise ValueError("سقف استفاده از این کد تخفیف تکمیل شده است.")
+    user_used = await _count_active_redemptions(session, coupon.id, now, user_id=user_id)
+    if user_used >= coupon.per_user_limit:
+        raise ValueError("این کد تخفیف قبلاً برای این کاربر استفاده یا رزرو شده است.")
+
+
 async def reserve_coupon(
     session,
     *,
@@ -82,30 +139,11 @@ async def reserve_coupon(
         raise ValueError("کد تخفیف معتبر یا فعال نیست.")
     now = _now()
     await _release_stale_reservations(session, coupon.id, now)
-    if coupon.valid_from and coupon.valid_from > now:
-        raise ValueError("زمان شروع این کد تخفیف هنوز نرسیده است.")
-    if coupon.valid_until and coupon.valid_until < now:
-        raise ValueError("اعتبار این کد تخفیف تمام شده است.")
-    if not await _scope_ok(session, coupon, user_id=user_id, plan_id=plan_id):
-        raise ValueError("این کد تخفیف برای این کاربر یا پلن قابل استفاده نیست.")
-
-    used = int(await session.scalar(
-        select(func.count()).select_from(CouponRedemption).where(
-            CouponRedemption.coupon_id == coupon.id,
-            CouponRedemption.status.in_(["RESERVED", "REDEEMED"]),
-        )
-    ) or 0)
-    if coupon.max_uses is not None and used >= coupon.max_uses:
-        raise ValueError("سقف استفاده از این کد تخفیف تکمیل شده است.")
-    user_used = int(await session.scalar(
-        select(func.count()).select_from(CouponRedemption).where(
-            CouponRedemption.coupon_id == coupon.id,
-            CouponRedemption.user_id == user_id,
-            CouponRedemption.status.in_(["RESERVED", "REDEEMED"]),
-        )
-    ) or 0)
-    if user_used >= coupon.per_user_limit:
-        raise ValueError("این کد تخفیف قبلاً برای این کاربر استفاده یا رزرو شده است.")
+    # [P1-13] Shared gate (validity/scope/max_uses/per_user_limit) — same checks
+    # preview_coupon runs, so preview and reserve can never disagree. The stale
+    # release above already cleared expired RESERVED rows, so the TTL-aware count
+    # below matches exactly what is left active.
+    await _assert_coupon_usable(session, coupon, user_id=user_id, plan_id=plan_id, now=now)
 
     if coupon.discount_type == "FIXED_TOMAN" and amount_toman <= 0:
         raise ValueError("کد مبلغ ثابت فقط برای پرداخت تومانی قابل استفاده است.")
@@ -146,15 +184,39 @@ async def reserve_coupon(
 
 
 async def redeem_coupon_for_order(session, *, order_id: UUID) -> None:
+    """Settle-time coupon redemption (exactly once per order).
+
+    [5-INT-b / 5-G13-c] Accounting-bypass fix: the 30-min TTL sweep
+    (_release_stale_reservations) may flip a STILL-PAYABLE order's row to
+    RELEASED before the user actually pays (Stars invoices stay payable
+    indefinitely). That row was legitimately reserved at order-creation time,
+    so settle must count it: RESERVED→REDEEMED *and* RELEASED→REDEEMED are both
+    accepted. Row ownership is guaranteed by the WHERE order_id == :order_id
+    lookup (uq_coupon_redemption_order keeps one row per (coupon, order)).
+    Second settle call sees status REDEEMED → no-op (idempotent).
+
+    [5-INT-b / 5-G13-c] Settle-time re-validation (fail-closed): the coupon must
+    still be active and inside its validity window at the moment of settlement —
+    a stale invoice paid after admin deactivation/expiry must NOT count a
+    redemption. Raise ValueError so the settle caller treats it as failure
+    (callers: billing.settle_star_payment / winapay_billing.settle_winapay_order).
+    """
     row = await session.scalar(
         select(CouponRedemption).where(CouponRedemption.order_id == order_id).with_for_update()
     )
     if row is None or row.status == "REDEEMED":
         return
-    if row.status == "RESERVED":
-        row.status = "REDEEMED"
-        row.redeemed_at = _now()
-        await session.flush()
+    if row.status not in ("RESERVED", "RELEASED"):
+        return
+    coupon = await session.scalar(select(Coupon).where(Coupon.id == row.coupon_id))
+    now = _now()
+    if coupon is None or not coupon.active:
+        raise ValueError("این کد تخفیف غیرفعال شده است؛ استفاده از آن در زمان تسویه ثبت نشد.")
+    if coupon.valid_until and coupon.valid_until < now:
+        raise ValueError("اعتبار این کد تخفیف در زمان تسویه تمام شده بود؛ تخفیف ثبت نشد.")
+    row.status = "REDEEMED"
+    row.redeemed_at = now
+    await session.flush()
 
 
 async def release_coupon_for_order(session, *, order_id: UUID) -> None:
@@ -173,12 +235,10 @@ async def preview_coupon(session, *, code: str, user_id: UUID, plan_id: UUID, am
     if coupon is None or not coupon.active:
         raise ValueError("کد تخفیف معتبر یا فعال نیست.")
     now = _now()
-    if coupon.valid_from and coupon.valid_from > now:
-        raise ValueError("زمان شروع این کد تخفیف هنوز نرسیده است.")
-    if coupon.valid_until and coupon.valid_until < now:
-        raise ValueError("اعتبار این کد تخفیف تمام شده است.")
-    if not await _scope_ok(session, coupon, user_id=user_id, plan_id=plan_id):
-        raise ValueError("این کد تخفیف برای این کاربر یا پلن قابل استفاده نیست.")
+    # [P1-13] Preview enforces the SAME eligibility gate (validity, scope,
+    # max_uses, per_user_limit) that reserve_coupon enforces — a preview can
+    # never promise a discount that the settle path would refuse.
+    await _assert_coupon_usable(session, coupon, user_id=user_id, plan_id=plan_id, now=now)
     # [P0-1] TRUE discount amounts (base - payable), same contract as reserve_coupon.
     discount_toman = (
         amount_toman - _payable_toman(amount_toman, coupon.discount_type, coupon.value)

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from aiogram.types import User as TgUser
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.db.models import Role, User, Wallet, user_roles
 from app.runtime.model_introspection import first_attr, model_values
@@ -41,9 +42,20 @@ async def ensure_user(session, tg_user: TgUser):
         )
         user = User(**values)
         session.add(user)
-        await session.flush()
-        await ensure_wallet(session, user)
-        return user
+        try:
+            # savepoint: رقابت get-or-create روی users.telegram_user_id UNIQUE —
+            # در صورت برخورد، savepoint بازگردانی می‌شود و ردیف برنده دوباره خوانده می‌شود.
+            async with session.begin_nested():
+                await session.flush()
+        except IntegrityError:
+            user = await session.scalar(select(User).where(tg_id_col == tg_user.id))
+            if user is None:
+                raise
+            wallet_id = await session.scalar(select(Wallet.id).where(Wallet.user_id == user.id))
+            row = (user, wallet_id)  # ادامه از مسیر مشترک تازه‌سازی پایین
+        else:
+            await ensure_wallet(session, user)
+            return user
 
     user, wallet_id = row
     columns = User.__table__.columns
@@ -81,7 +93,15 @@ async def ensure_wallet(session, user):
         )
         wallet = Wallet(**values)
         session.add(wallet)
-        await session.flush()
+        try:
+            # savepoint: رقابت get-or-create روی wallets.user_id UNIQUE —
+            # ردیف برنده از تراکنش هم‌زمان دوباره خوانده می‌شود.
+            async with session.begin_nested():
+                await session.flush()
+        except IntegrityError:
+            wallet = await session.scalar(select(Wallet).where(Wallet.user_id == user.id))
+            if wallet is None:
+                raise
     return wallet
 
 

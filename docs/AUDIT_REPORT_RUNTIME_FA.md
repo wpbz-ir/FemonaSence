@@ -1,3 +1,5 @@
+> ⚠️ سند تاریخی/منسوخ — ممکن است با نسخه فعلی مخزن (head مایگریشن: 0017_ads_system) هم‌خوان نباشد. مرجع روزآمد: docs/ARCHITECTURE_FA.md و deploy/README_PRODUCTION_FA.md
+
 # گزارش نهایی ممیزی Runtime و اصلاحات بحرانی — فمونا سنس (CinemaVault)
 
 **تاریخ ممیزی:** 2026-09-25

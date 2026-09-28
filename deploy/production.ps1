@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Force $LogDir | Out-Null
 $services = @(
     @{
         Name = "API"
-        Args = @("-m","uvicorn","app.api.main:app","--host","127.0.0.1","--port","8000","--workers","1")
+        Args = @("-m","uvicorn","app.api.main:app","--host","127.0.0.1","--port","8000","--workers","1","--no-server-header")
         Out = Join-Path $LogDir "api.out.log"
         Err = Join-Path $LogDir "api.err.log"
     },

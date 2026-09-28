@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import selectinload
 
 from app.db.models import (
@@ -201,19 +203,37 @@ async def build_quality_matrix(
         .options(selectinload(ContentPipelineRun.items))
     )
 
+    inserted_here = False
     if run is None:
-        run = ContentPipelineRun(
-            title_id=title_id,
-            source_release_id=source.id,
-            source_storage_file_id=storage.id,
-            requested_qualities=qualities,
-            status="QUEUED",
-            created_by_user_id=created_by_user_id,
-            dedupe_key=dedupe_key,
+        # SELECT-then-INSERT race on uq_content_pipeline_runs_dedupe: two
+        # concurrent matrix builds can both observe "no run" above. Make the
+        # insert idempotent (ON CONFLICT DO NOTHING) and re-SELECT the
+        # surviving row instead of crashing with an uncaught IntegrityError.
+        insert_result = await session.execute(
+            pg_insert(ContentPipelineRun)
+            .values(
+                id=uuid.uuid4(),
+                title_id=title_id,
+                source_release_id=source.id,
+                source_storage_file_id=storage.id,
+                requested_qualities=qualities,
+                status="QUEUED",
+                created_by_user_id=created_by_user_id,
+                dedupe_key=dedupe_key,
+            )
+            .on_conflict_do_nothing(constraint="uq_content_pipeline_runs_dedupe")
         )
-        session.add(run)
-        await session.flush()
-    elif run.status in {"QUEUED", "RUNNING", "SUCCEEDED"}:
+        # rowcount == 1 iff THIS txn won the insert race.
+        inserted_here = (insert_result.rowcount or 0) > 0
+        run = await session.scalar(
+            select(ContentPipelineRun)
+            .where(ContentPipelineRun.dedupe_key == dedupe_key)
+            .options(selectinload(ContentPipelineRun.items))
+        )
+        if run is None:  # defensive: our own committed-in-txn write must exist
+            raise PipelineError("Pipeline run could not be created or fetched.")
+
+    if not inserted_here and run.status in {"QUEUED", "RUNNING", "SUCCEEDED"}:
         return run
 
     if run.status == "FAILED":
@@ -269,27 +289,56 @@ async def build_quality_matrix(
                     ),
                 },
             )
-            target = Release(
+            candidate = Release(
                 title_id=title_id if parent_type == "TITLE" else None,
                 episode_id=episode_id if parent_type == "EPISODE" else None,
                 **common,
             )
-            session.add(target)
+            session.add(candidate)
             await session.flush()
+            # Nested re-check inside the same txn: pipeline_key has NO unique
+            # index (no migration allowed here), so a concurrent builder that
+            # committed its DRAFT between our first SELECT and the flush above
+            # would otherwise leave two DRAFT releases for one pipeline_key.
+            # Yield to the rival row and drop our uncommitted candidate.
+            rival = await session.scalar(
+                select(Release).where(
+                    Release.pipeline_key == pipeline_key,
+                    Release.id != candidate.id,
+                )
+            )
+            if rival is not None:
+                await session.delete(candidate)
+                await session.flush()
+                target = rival
+            else:
+                target = candidate
 
         policy = await session.scalar(
             select(AccessPolicy).where(AccessPolicy.release_id == target.id)
         )
         if policy is None:
-            policy = AccessPolicy(
-                release_id=target.id,
-                access_type="PREMIUM" if requires_subscription else "PUBLIC",
-                requires_subscription=bool(requires_subscription),
-                minimum_plan_rank=max(0, int(minimum_plan_rank)),
-                active=True,
-                extra_data={"source": "content_pipeline"},
+            # RACE (uq_access_policies_release): یک سازندهٔ هم‌زمان می‌تواند پالیسیِ
+            # همان target را بین SELECT بالا و flush ما ثبت کند — ON CONFLICT DO NOTHING
+            # + re-select تضمین می‌کند دقیقاً یک ردیف بماند و IntegrityError بالا نزند.
+            await session.execute(
+                pg_insert(AccessPolicy)
+                .values(
+                    release_id=target.id,
+                    access_type="PREMIUM" if requires_subscription else "PUBLIC",
+                    requires_subscription=bool(requires_subscription),
+                    minimum_plan_rank=max(0, int(minimum_plan_rank)),
+                    active=True,
+                    extra_data={"source": "content_pipeline"},
+                )
+                .on_conflict_do_nothing(constraint="uq_access_policies_release")
             )
-            session.add(policy)
+            policy = await session.scalar(
+                select(AccessPolicy).where(AccessPolicy.release_id == target.id)
+            )
+            if policy is None:
+                # عملاً دست‌نیافتنی: DO NOTHING یعنی برندهٔ هم‌زمان کامیت شده و دیده می‌شود.
+                raise RuntimeError(f"access policy row missing for release {target.id} after upsert")
         else:
             policy.requires_subscription = bool(requires_subscription)
             policy.minimum_plan_rank = max(0, int(minimum_plan_rank))

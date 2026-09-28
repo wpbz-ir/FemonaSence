@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.core.database import async_database_url
+from app.core.database import async_engine_kwargs_from_url
 from app.core.media_config import load_media_settings
 from app.services.content_pipeline import sync_pipeline_run
 from app.services.ffmpeg_engine import FFmpegError, probe, transcode
@@ -50,9 +50,19 @@ LEASE_HEARTBEAT_BACKOFF_MAX = 30.0
 POLL_ERROR_BACKOFF_MIN = 2.0
 POLL_ERROR_BACKOFF_MAX = 5.0
 
+# [INT-c] Stale-lease recovery cadence: recover_stale_jobs() runs every N poll
+# iterations (and once before the first claim) instead of ONCE per process
+# lifetime. Previously the recovery block ran a single time and the loop body
+# ended in an unconditional ``break``; if the RUNTIME maintenance loop was
+# down/failing, lease-expired RUNNING jobs stayed RUNNING forever. A short
+# session per recovery keeps the extra DB work negligible.
+RECOVER_EVERY_N_POLLS = 20
+
 
 def _db_url() -> str:
-    return async_database_url(os.getenv("DATABASE_URL", "").strip())
+    # Kept as a named seam for tests; the Neon "-pooler" statement-cache guard
+    # and pool_pre_ping/recycle live in async_engine_kwargs_from_url().
+    return async_engine_kwargs_from_url(os.getenv("DATABASE_URL", ""))["url"]
 
 
 def _sha256(path: Path) -> str:
@@ -99,15 +109,25 @@ class MediaWorker:
     def __init__(self):
         load_dotenv()
         self.settings = load_media_settings()
+        # [INT-c] Fail fast and loud on a missing bot token — mirrors the
+        # notification worker (app/workers/notification_worker.py:
+        # ``RuntimeError("BOT_TOKEN is not configured.")``). Previously the
+        # worker started token-less and only died in a 401 storm at the first
+        # Telegram call.
+        token = os.getenv("BOT_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("BOT_TOKEN is not configured.")
+        # [INT-c/M3] Engine built with the SAME Neon pooler guard as
+        # app/db/session.py (statement_cache_size=0 on "-pooler" hosts) via the
+        # shared helper in app/core/database.py.
         self.engine = create_async_engine(
-            _db_url(),
-            pool_pre_ping=True,
+            **async_engine_kwargs_from_url(os.getenv("DATABASE_URL", "")),
             pool_size=5,
             max_overflow=5,
         )
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self.telegram = TelegramMediaClient(
-            token=os.getenv("BOT_TOKEN", "").strip(),
+            token=token,
             base_url=self.settings.bot_api_base_url,
         )
         self.semaphore = asyncio.Semaphore(self.settings.worker_concurrency)
@@ -115,27 +135,34 @@ class MediaWorker:
 
     async def run(self):
         self.settings.work_root.mkdir(parents=True, exist_ok=True)
-        while not self.stop_event.is_set():
-            async with self.sessions() as session:
-                recovered = await recover_stale_jobs(
-                    session,
-                    lease_seconds=self.settings.lease_seconds,
-                )
-                await heartbeat(
-                    session,
-                    service_name="media_worker",
-                    metadata={
-                        "worker_id": self.settings.worker_id,
-                        "concurrency": self.settings.worker_concurrency,
-                        "recovered_jobs": recovered,
-                    },
-                )
-                await session.commit()
-            break
-
         tasks: set[asyncio.Task] = set()
+        poll_count = 0
         while not self.stop_event.is_set():
             try:
+                # [INT-c] Periodic stale-lease recovery: once before the first
+                # claim and then every RECOVER_EVERY_N_POLLS successful polls
+                # (a failing iteration retries recovery on the next pass).
+                # The heartbeat metadata keeps reporting the recovered count so
+                # /instance + dashboard visibility is unchanged.
+                if poll_count % RECOVER_EVERY_N_POLLS == 0:
+                    async with self.sessions() as session:
+                        recovered = await recover_stale_jobs(
+                            session,
+                            lease_seconds=self.settings.lease_seconds,
+                        )
+                        await heartbeat(
+                            session,
+                            service_name="media_worker",
+                            metadata={
+                                "worker_id": self.settings.worker_id,
+                                "concurrency": self.settings.worker_concurrency,
+                                "recovered_jobs": recovered,
+                            },
+                        )
+                        await session.commit()
+                    if recovered:
+                        logger.info("media worker requeued %d stale job(s)", recovered)
+
                 while len(tasks) < self.settings.worker_concurrency and not self.stop_event.is_set():
                     async with self.sessions() as session:
                         job = await claim_job(session, worker_id=self.settings.worker_id)
@@ -169,6 +196,7 @@ class MediaWorker:
                 )
                 continue
 
+            poll_count += 1
             await asyncio.sleep(self.settings.poll_seconds)
 
         if tasks:

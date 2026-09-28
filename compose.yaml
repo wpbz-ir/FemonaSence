@@ -8,7 +8,9 @@ services:
       POSTGRES_USER: cinema_vault
       POSTGRES_PASSWORD: CHANGE_ME
     ports:
-      - "5432:5432"
+      # Bind to loopback only: Postgres must not be reachable from the internet
+      # (or from other machines on the LAN); the app connects via localhost.
+      - "127.0.0.1:5432:5432"
     volumes:
       - cinema_vault_pgdata:/var/lib/postgresql/data
 
@@ -16,8 +18,14 @@ services:
     image: redis:8
     container_name: cinema-vault-redis
     restart: unless-stopped
+    # SECURITY: in internet-exposed environments, ALSO run Redis with a password:
+    #   command: ["redis-server", "--requirepass", "<strong-password>"]
+    # and append the password to the app's REDIS_URL (redis://:pass@host:6379/0).
+    # Auth is intentionally NOT enabled here by default: the current REDIS_URL
+    # in .env has no password, so enabling it without that change would break
+    # the runtime/API/workers at startup.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - cinema_vault_redisdata:/data
 

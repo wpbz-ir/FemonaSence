@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $Project = "C:\CinemaVault"
 $Python = Join-Path $Project ".venv\Scripts\python.exe"
 $Tasks = @(
-    @{Name="FemonaSense Web"; Args="-m uvicorn app.api.main:app --host 127.0.0.1 --port 8000 --workers 1"},
+    @{Name="FemonaSense Web"; Args="-m uvicorn app.api.main:app --host 127.0.0.1 --port 8000 --workers 1 --no-server-header"},
     @{Name="FemonaSense Runtime"; Args="-m app.workers.runtime_worker"},
     @{Name="FemonaSense Media"; Args="-m app.workers.media_worker"}
 )

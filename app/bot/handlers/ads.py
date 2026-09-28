@@ -249,14 +249,20 @@ async def ads_approve(callback: CallbackQuery):
     except (ValueError, IndexError, AttributeError):
         await callback.answer("شناسه درخواست نامعتبر است.", show_alert=True)
         return
-    async with session_scope() as session:
-        row = await set_ad_request_status(
-            session, request_id, status="APPROVED", admin_note=None,
-            reviewer_user_id=await _reviewer_id(session, callback.from_user.id),
-        )
-        setting = await get_ad_settings(session)
-        target = _channel_target(setting)
-        auto = bool(setting and setting.auto_channel_publish)
+    try:
+        async with session_scope() as session:
+            row = await set_ad_request_status(
+                session, request_id, status="APPROVED", admin_note=None,
+                reviewer_user_id=await _reviewer_id(session, callback.from_user.id),
+            )
+            setting = await get_ad_settings(session)
+            target = _channel_target(setting)
+            auto = bool(setting and setting.auto_channel_publish)
+    except ValueError:
+        # دستگاه وضعیت G19-a: تأیید دوباره/ردیف ترمینال → گذار نامجاز؛
+        # session_scope خودش rollback می‌کند و اینجا با هشدار فارسی پاسخ می‌دهیم.
+        await callback.answer("این درخواست قبلاً بررسی یا منتشر شده است؛ تغییر وضعیت ممکن نیست.", show_alert=True)
+        return
     if row is None:
         await callback.answer("درخواست پیدا نشد.", show_alert=True)
         return
@@ -283,11 +289,16 @@ async def ads_reject(callback: CallbackQuery):
     except (ValueError, IndexError, AttributeError):
         await callback.answer("شناسه درخواست نامعتبر است.", show_alert=True)
         return
-    async with session_scope() as session:
-        row = await set_ad_request_status(
-            session, request_id, status="REJECTED", admin_note=None,
-            reviewer_user_id=await _reviewer_id(session, callback.from_user.id),
-        )
+    try:
+        async with session_scope() as session:
+            row = await set_ad_request_status(
+                session, request_id, status="REJECTED", admin_note=None,
+                reviewer_user_id=await _reviewer_id(session, callback.from_user.id),
+            )
+    except ValueError:
+        # دستگاه وضعیت G19-a: ردِ دوباره/ردیف ترمینال (منتشرشده) → گذار نامجاز.
+        await callback.answer("این درخواست قبلاً بررسی یا منتشر شده است؛ تغییر وضعیت ممکن نیست.", show_alert=True)
+        return
     if row is None:
         await callback.answer("درخواست پیدا نشد.", show_alert=True)
         return
@@ -343,8 +354,6 @@ async def _reviewer_id(session, telegram_user_id: int):
 
 async def _publish_to_channel(bot, target: str, request_id) -> bool:
     """انتشار درخواست تأییدشده در کانال تبلیغات؛ کپی از پیام اصلی با fallback به file_id."""
-    from datetime import datetime, timezone
-
     from app.db.models import AdRequest
 
     async with session_scope() as session:
@@ -384,7 +393,15 @@ async def _publish_to_channel(bot, target: str, request_id) -> bool:
     async with session_scope() as session:
         row = await session.get(AdRequest, request_id)
         if row is not None:
-            row.status = "PUBLISHED"
+            # گذار APPROVED→PUBLISHED از دستگاه وضعیت (G19-a) عبور می‌کند، نه نوشتن مستقیم؛
+            # reviewed_by حفظ می‌شود تا ممیزی از دست نرود.
+            try:
+                await set_ad_request_status(
+                    session, request_id, status="PUBLISHED", admin_note=None,
+                    reviewer_user_id=row.reviewed_by,
+                )
+            except ValueError:
+                # ردیف هم‌زمان توسط ادمین دیگری رد/منتشر شده — انتشارِ وضعیت را بی‌اثر می‌کنیم.
+                return False
             row.published_message_id = sent.message_id
-            row.reviewed_at = row.reviewed_at or datetime.now(timezone.utc)
     return True
