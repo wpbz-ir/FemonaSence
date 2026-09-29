@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import shutil
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -57,6 +58,17 @@ POLL_ERROR_BACKOFF_MAX = 5.0
 # down/failing, lease-expired RUNNING jobs stayed RUNNING forever. A short
 # session per recovery keeps the extra DB work negligible.
 RECOVER_EVERY_N_POLLS = 20
+
+# [SOURCE-CACHE] قفل/انتظارِ دانلود مشترک فایل منبع. دانلودِ برنده با
+# ClientTimeout(total=3600) محدود است؛ انتظارچی کمی بیشتر صبر می‌کند، بعد
+# قفلِ یتیم‌شده را می‌دزدد و خودش دانلود می‌کند.
+SOURCE_CACHE_LOCK_STALE_SECONDS = 3900
+SOURCE_CACHE_WAIT_POLL_SECONDS = 10.0
+
+
+def shared_source_path(work_root: Path, source_storage_file_id) -> Path:
+    """مسیر قطعی فایل منبع مشترک برای یک storage_file_id."""
+    return work_root / "shared" / str(source_storage_file_id) / "source.bin"
 
 
 def _db_url() -> str:
@@ -162,6 +174,7 @@ class MediaWorker:
                         await session.commit()
                     if recovered:
                         logger.info("media worker requeued %d stale job(s)", recovered)
+                    await self._janitor_shared_sources()
 
                 while len(tasks) < self.settings.worker_concurrency and not self.stop_event.is_set():
                     async with self.sessions() as session:
@@ -234,6 +247,9 @@ class MediaWorker:
                 # چندگیگابایتی روی دیسک باقی نمانند.
                 if self.settings.cleanup_temp:
                     shutil.rmtree(self.settings.work_root / str(job["id"]), ignore_errors=True)
+                # [SOURCE-CACHE] کش منبع فقط وقتی حذف می‌شود که هیچ job فعالی
+                # (شامل تلاش بعدی همین job در حالت RETRY) به آن ارجاع ندهد.
+                await self._maybe_cleanup_shared_source(job["source_storage_file_id"])
 
     async def _lease_heartbeat(self, job_id, stop: asyncio.Event):
         """Keep the RUNNING job's lease alive for the whole pipeline.
@@ -274,6 +290,133 @@ class MediaWorker:
                 await asyncio.sleep(backoff)
                 backoff = min(LEASE_HEARTBEAT_BACKOFF_MAX, backoff * 2)
 
+    async def _ensure_shared_source(self, job: dict, file_id: str) -> tuple[Path, bool]:
+        """[SOURCE-CACHE] دانلود یک‌بارهٔ فایل منبع و هم‌رسانی بین همهٔ jobهای کیفیت.
+
+        هماهنگی بین کارگرها با قفل فایلی (ایجاد انحصاری O_EXCL) است:
+        - برنده دانلود می‌کند، os.replace اتمی انجام می‌دهد و نشان .done می‌گذارد؛
+        - بقیه هر ۱۰ ثانیه نشان .done را چک می‌کنند؛ اگر قفلِ holder از
+          SOURCE_CACHE_LOCK_STALE_SECONDS قدیمی‌تر شد (کرش بدون finally)،
+          دزدیده می‌شود و انتظارچی خودش دانلود می‌کند.
+        بازگشت: (مسیر فایل کامل، آیا از کشِ آماده استفاده شد؟)
+        """
+        shared_dir = self.settings.work_root / "shared" / str(job["source_storage_file_id"])
+        final = shared_dir / "source.bin"
+        done = shared_dir / "source.bin.done"
+        lock = shared_dir / "source.bin.lock"
+        shared_dir.mkdir(parents=True, exist_ok=True)
+
+        if done.exists() and final.exists():
+            return final, True
+
+        while True:
+            try:
+                with lock.open("x", encoding="utf-8") as handle:
+                    handle.write(f"{self.settings.worker_id}\n")
+                break
+            except FileExistsError:
+                try:
+                    lock_age = time.time() - lock.stat().st_mtime
+                except OSError:
+                    lock_age = SOURCE_CACHE_LOCK_STALE_SECONDS + 1  # قفل ناپدید شده؛ دوباره تلاش کن
+                if lock_age > SOURCE_CACHE_LOCK_STALE_SECONDS:
+                    logger.warning(
+                        "قفل کش منبع یتیم شد (%.0f ثانیه) برای %s؛ دزدیده می‌شود.",
+                        lock_age,
+                        job["source_storage_file_id"],
+                    )
+                    lock.unlink(missing_ok=True)
+                    continue
+                if done.exists() and final.exists():
+                    return final, True
+                await asyncio.sleep(SOURCE_CACHE_WAIT_POLL_SECONDS)
+
+        try:
+            part = shared_dir / f"source.bin.{self.settings.worker_id}.part"
+            try:
+                await self.telegram.download_file(file_id=file_id, destination=part)
+                if part.stat().st_size < 1024:
+                    raise TelegramMediaError(
+                        "SOURCE_FILE_TOO_SMALL",
+                        "فایل منبع غیرمنتظره کوچک است؛ احتمالاً دانلود ناقص بوده است.",
+                    )
+                os.replace(part, final)
+                tmp_done = shared_dir / "source.bin.done.tmp"
+                tmp_done.write_text("ok", encoding="ascii")
+                os.replace(tmp_done, done)
+            finally:
+                part.unlink(missing_ok=True)
+        finally:
+            lock.unlink(missing_ok=True)
+        return final, False
+
+    async def _maybe_cleanup_shared_source(self, source_storage_file_id) -> None:
+        """[SOURCE-CACHE] حذف کش منبع وقتی هیچ job فعالی به آن ارجاع نمی‌دهد.
+
+        شمارش شامل همین job هم می‌شود؛ پس اگر mark_failure کار را به RETRY برده
+        باشد، کش برای تلاش بعدی حفظ می‌شود (دانلود مجدد حذف می‌شود).
+        """
+        if not self.settings.cleanup_temp or not self.settings.source_cache:
+            return
+        try:
+            async with self.sessions() as session:
+                pending = await session.scalar(
+                    text(
+                        """
+                        SELECT COUNT(*) FROM media_jobs
+                        WHERE source_storage_file_id = :sid
+                          AND status IN ('QUEUED', 'RETRY', 'RUNNING')
+                        """
+                    ),
+                    {"sid": source_storage_file_id},
+                )
+            if not pending:
+                shutil.rmtree(
+                    self.settings.work_root / "shared" / str(source_storage_file_id),
+                    ignore_errors=True,
+                )
+        except Exception:
+            logger.exception(
+                "پاک‌سازی کش منبع برای %s شکست خورد (روی دیسک ماند).",
+                source_storage_file_id,
+            )
+
+    async def _janitor_shared_sources(self) -> None:
+        """[SOURCE-CACHE] سرایدار کش منبع: پوشه‌های بی‌صاحبِ حاصل از کرش کارگر.
+
+        اگر کارگر وسط دانلود مشترک از کار بیفتد، پاک‌سازیِ پایانِ کار هرگز اجرا
+        نمی‌شود؛ این سرایدار (هر RECOVER_EVERY_N_POLLS) پوشه‌های shared را که
+        هیچ job فعالی به منبعشان ارجاع نمی‌دهد و دست‌کم یک ساعت بی‌تغییر
+        مانده‌اند حذف می‌کند.
+        """
+        shared_root = self.settings.work_root / "shared"
+        if not shared_root.is_dir():
+            return
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT DISTINCT source_storage_file_id
+                        FROM media_jobs
+                        WHERE status IN ('QUEUED', 'RETRY', 'RUNNING')
+                        """
+                    )
+                )
+            ).scalars().all()
+        active = {str(row) for row in rows}
+        now = time.time()
+        for child in shared_root.iterdir():
+            if not child.is_dir() or str(child.name) in active:
+                continue
+            try:
+                if now - child.stat().st_mtime < 3600:
+                    continue  # مهلت امن برای ساخت‌های در جریان
+                shutil.rmtree(child, ignore_errors=True)
+                logger.info("سرایدار کش منبع، پوشهٔ یتیم %s را حذف کرد.", child.name)
+            except OSError:
+                continue
+
     async def process_job(self, job: dict):
         job_id = job["id"]
         if job["job_type"] != "TRANSCODE":
@@ -295,8 +438,14 @@ class MediaWorker:
 
         work = self.settings.work_root / str(job_id)
         work.mkdir(parents=True, exist_ok=True)
-        input_path = work / "source.bin"
         output_path = work / f"release-{job['target_quality']}p.mp4"
+        # [SOURCE-CACHE] با کش مشترک، مسیر ورودیِ ثبت‌شده همان فایل مشترک است؛
+        # خودِ دانلود داخل _download_transcode_publish و زیر اجارهٔ اجاره انجام
+        # می‌شود (نه اینجا) تا heartbeat در طول دانلود زنده بماند.
+        if self.settings.source_cache:
+            input_path = shared_source_path(self.settings.work_root, job["source_storage_file_id"])
+        else:
+            input_path = work / "source.bin"
 
         async with self.sessions() as session:
             await session.execute(
@@ -362,10 +511,17 @@ class MediaWorker:
         """
         job_id = job["id"]
 
-        await self.telegram.download_file(
-            file_id=file_id,
-            destination=input_path,
-        )
+        # [SOURCE-CACHE] دانلود منبع یک‌بار برای همهٔ کیفیت‌ها (۱۰۸۰/۷۲۰/۴۸۰
+        # همان source_storage_file_id را دارند)؛ در حالت قدیمی هر job جداگانه
+        # کل فایل منبع را دانلود می‌کرد — روی لینک کند یعنی ۳ برابر زمان.
+        cache_hit = False
+        if self.settings.source_cache:
+            input_path, cache_hit = await self._ensure_shared_source(job, file_id)
+        else:
+            await self.telegram.download_file(
+                file_id=file_id,
+                destination=input_path,
+            )
         if input_path.stat().st_size < 1024:
             raise TelegramMediaError(
                 "SOURCE_FILE_TOO_SMALL",
@@ -386,8 +542,12 @@ class MediaWorker:
             await append_event(
                 session,
                 job_id=job_id,
-                event_type="DOWNLOADED",
-                message="فایل منبع دانلود شد.",
+                event_type="SOURCE_CACHE_HIT" if cache_hit else "DOWNLOADED",
+                message=(
+                    "فایل منبع از کش مشترک بازیابی شد (دانلود مجدد حذف شد)."
+                    if cache_hit
+                    else "فایل منبع دانلود شد."
+                ),
             )
             await session.commit()
 

@@ -44,7 +44,7 @@ async def recover_stale_jobs(session, *, lease_seconds: int) -> int:
                 available_at = CURRENT_TIMESTAMP + make_interval(secs => :lease_seconds),
                 updated_at = CURRENT_TIMESTAMP,
                 error_code = 'STALE_LEASE',
-                error_message = 'Worker lease expired; job returned to queue.'
+                error_message = 'اجازهٔ پردازش‌گر منقضی شد؛ کار به صف بازگشت.'
             WHERE status = 'RUNNING'
               AND attempts < max_attempts
               AND COALESCE(heartbeat_at, locked_at) < CURRENT_TIMESTAMP - make_interval(secs => :lease_seconds)
@@ -65,7 +65,7 @@ async def recover_stale_jobs(session, *, lease_seconds: int) -> int:
                 locked_at = NULL,
                 heartbeat_at = NULL,
                 error_code = 'STALE_LEASE',
-                error_message = 'Worker lease expired and attempts budget exhausted; job marked FAILED.',
+                error_message = 'اجازهٔ پردازش‌گر منقضی شد و سهمیهٔ تلاش‌ها به پایان رسید؛ کار ناموفق علامت خورد. پردازش‌گر رسانه احتمالاً در حین کار قطع یا ری‌استارت شده است؛ از پنل دوباره تلاش کنید.',
                 updated_at = CURRENT_TIMESTAMP
             WHERE status = 'RUNNING'
               AND attempts >= max_attempts
@@ -89,7 +89,7 @@ async def recover_stale_jobs(session, *, lease_seconds: int) -> int:
                 locked_at = NULL,
                 heartbeat_at = NULL,
                 error_code = 'CANCELLED_BY_OPERATOR',
-                error_message = 'Operator cancel requested; job marked FAILED instead of retrying.',
+                error_message = 'به درخواست مدیر، کار به‌جای تلاش مجدد ناموفق علامت خورد.',
                 updated_at = CURRENT_TIMESTAMP
             WHERE status = 'RETRY'
               AND cancel_requested = TRUE

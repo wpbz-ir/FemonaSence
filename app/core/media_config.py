@@ -27,6 +27,9 @@ class MediaSettings:
     audio_bitrate: str
     max_attempts: int
     ffmpeg_timeout_seconds: int
+    # کش مشترک فایل منبع: چند jobِ کیفیتِ هم‌منبع، یک‌بار دانلود می‌کنند
+    # (MEDIA_SOURCE_CACHE=0 برای غیرفعال‌سازی).
+    source_cache: bool
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -148,4 +151,5 @@ def load_media_settings() -> MediaSettings:
         audio_bitrate=os.getenv("MEDIA_AUDIO_BITRATE", "128k").strip(),
         max_attempts=max(1, min(_int("MEDIA_MAX_JOB_ATTEMPTS", 3), 10)),
         ffmpeg_timeout_seconds=max(300, _int("MEDIA_FFMPEG_TIMEOUT_SECONDS", 21600)),
+        source_cache=_bool("MEDIA_SOURCE_CACHE", True),
     )
