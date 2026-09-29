@@ -21,7 +21,9 @@ from app.services.ads import (
     super_admin_telegram_ids,
 )
 from app.services.membership import is_admin_user
+from app.services.rate_limit import RateLimitExceeded, RateLimitUnavailable, enforce
 from app.services.user_account import ensure_user
+from app.utils.telegram_ui import edit_or_send
 
 router = Router(name="ads")
 
@@ -57,7 +59,8 @@ async def ads_menu(callback: CallbackQuery, state: FSMContext):
         row = await get_ad_settings(session)
     active = bool(row and row.active)
     if not active:
-        await callback.message.edit_text(
+        await edit_or_send(
+            callback,
             "<b>📣 تبلیغات</b>\n\nبخش تبلیغات در حال حاضر غیرفعال است.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")]]),
         )
@@ -74,7 +77,7 @@ async def ads_menu(callback: CallbackQuery, state: FSMContext):
         lines.append(f"📢 کانال تبلیغات: {html.escape(_channel_target(row))}")
         lines.append("")
     lines.append("می‌توانید پست یا محتوای تبلیغ خود را ارسال کنید تا پس از تأیید، در کانال تبلیغات منتشر شود.")
-    await callback.message.edit_text("\n".join(lines), reply_markup=_ads_back_keyboard())
+    await edit_or_send(callback, "\n".join(lines), reply_markup=_ads_back_keyboard())
 
 
 @router.callback_query(F.data == "cv:ad:send")
@@ -85,7 +88,8 @@ async def ads_send_start(callback: CallbackQuery, state: FSMContext):
         setting = await get_ad_settings(session)
     if not (setting and setting.active):
         await state.clear()
-        await callback.message.edit_text(
+        await edit_or_send(
+            callback,
             "بخش تبلیغات در حال حاضر غیرفعال است.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")],
@@ -93,7 +97,8 @@ async def ads_send_start(callback: CallbackQuery, state: FSMContext):
         )
         return
     await state.set_state(AdRequestState.waiting_content)
-    await callback.message.edit_text(
+    await edit_or_send(
+        callback,
         "<b>📨 ارسال محتوای تبلیغ</b>\n\n"
         "محتوای تبلیغ خود را در همین چت ارسال کنید:\n"
         "• متن آگهی\n"
@@ -110,7 +115,7 @@ async def ads_send_start(callback: CallbackQuery, state: FSMContext):
 async def ads_send_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer("انصراف ثبت شد.")
     await state.clear()
-    await callback.message.edit_text("ارسال تبلیغ لغو شد.", reply_markup=InlineKeyboardMarkup(
+    await edit_or_send(callback, "ارسال تبلیغ لغو شد.", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="📣 بازگشت به تبلیغات", callback_data="menu:ads")]]
     ))
 
@@ -144,6 +149,20 @@ async def ads_state_other_commands(message: Message, state: FSMContext):
 
 @router.message(AdRequestState.waiting_content, F.text | F.photo | F.video | F.animation | F.document)
 async def ads_receive_content(message: Message, state: FSMContext):
+    # [P2] محدودیت نرخ ارسال تبلیغ: هر درخواست به همه‌ی ابرادمین‌ها اطلاع‌رسانی
+    # می‌کند؛ اسپمِ کاربر نباید اسپمِ اطلاع‌رسانیِ ادمین بسازد (همان الگوی
+    # limiter کد تخفیف در payments.py). شکستِ limiter عمداً fail-open است
+    # (قطع Redis نباید ثبت تبلیغ را به‌کلی ببندد). state حفظ می‌شود تا کاربر
+    # بعداً دوباره تلاش یا انصراف دهد.
+    try:
+        await enforce(f"ads:{message.from_user.id}", limit=3, window_seconds=300)
+    except RateLimitExceeded:
+        await message.answer(
+            "تعداد درخواست‌های تبلیغ بیش از حد مجاز است؛ کمی بعد دوباره تلاش کنید."
+        )
+        return
+    except RateLimitUnavailable:
+        pass
     content_type = "TEXT"
     file_id = None
     if message.photo:

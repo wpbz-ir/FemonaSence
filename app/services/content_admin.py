@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import settings
 from app.core.text import clean_text
@@ -83,7 +84,7 @@ async def create_title(
     title_en = clean_text(title_en, 255) or None
     original_title = clean_text(original_title, 255) or None
     synopsis = clean_text(synopsis) or None
-    rights_reference = clean_text(rights_reference, 500) or None
+    rights_reference = clean_text(rights_reference, 255) or None
     title = Title(
         kind=normalized_kind,
         title_fa=title_fa,
@@ -223,28 +224,32 @@ async def register_telegram_storage_file(
     if provider is None:
         raise ValueError("Telegram Storage Provider وجود ندارد. Seed را اجرا کنید.")
 
-    existing = await session.scalar(
+    # [FIX] SELECT-then-INSERT race on uq_storage_files_provider_unique: the
+    # bot channel ingest and the panel storage_register can both pass the
+    # pre-SELECT and one dies with an uncaught IntegrityError -> 500.
+    # INSERT ... ON CONFLICT DO NOTHING on the same constraint, then re-select
+    # the surviving row (mirrors telegram_media.register_storage_file).
+    await session.execute(
+        pg_insert(StorageFile).values(
+            provider_id=provider.id,
+            chat_id=chat_id,
+            message_id=message_id,
+            file_id=file_id,
+            file_unique_key=file_unique_key,
+            filename=filename,
+            size_bytes=size_bytes,
+            status="READY",
+        ).on_conflict_do_nothing(constraint="uq_storage_files_provider_unique")
+    )
+    stored = await session.scalar(
         select(StorageFile).where(
             StorageFile.provider_id == provider.id,
             StorageFile.file_unique_key == file_unique_key,
         )
     )
-    if existing:
-        return existing
-
-    row = StorageFile(
-        provider_id=provider.id,
-        chat_id=chat_id,
-        message_id=message_id,
-        file_id=file_id,
-        file_unique_key=file_unique_key,
-        filename=filename,
-        size_bytes=size_bytes,
-        status="READY",
-    )
-    session.add(row)
-    await session.flush()
-    return row
+    if stored is None:
+        raise ValueError("ردیف ذخیره‌سازی پس از ثبت ناپدید شد.")
+    return stored
 
 
 async def attach_storage_file(session, *, release_id, storage_file_id, primary=True):

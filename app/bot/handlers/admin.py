@@ -9,6 +9,7 @@ from app.db.models import Order, Release, Subscription, Title, User
 from app.runtime.db import session_scope
 from app.services.rbac import is_super_admin
 from app.services.user_account import ensure_user
+from app.utils.telegram_ui import edit_or_send
 
 
 async def send_admin(callback: CallbackQuery):
@@ -16,7 +17,7 @@ async def send_admin(callback: CallbackQuery):
     async with session_scope() as session:
         user = await ensure_user(session, callback.from_user)
         if getattr(user, "status", "ACTIVE") != "ACTIVE" or not await is_super_admin(session, user.id):
-            await callback.message.edit_text("دسترسی مدیریت ندارید.", reply_markup=back_home_keyboard())
+            await edit_or_send(callback, "دسترسی مدیریت ندارید.", reply_markup=back_home_keyboard())
             return
 
         users = await session.scalar(select(func.count()).select_from(User))
@@ -25,7 +26,8 @@ async def send_admin(callback: CallbackQuery):
         subscriptions = await session.scalar(select(func.count()).select_from(Subscription))
         orders = await session.scalar(select(func.count()).select_from(Order))
 
-    await callback.message.edit_text(
+    await edit_or_send(
+        callback,
         f"<b>🛠 مرکز مدیریت {BRAND_NAME_FA}</b>\n\n"
         f"👤 کاربران: <b>{users or 0}</b>\n"
         f"🎬 عناوین: <b>{titles or 0}</b>\n"

@@ -146,7 +146,7 @@ async def root():
 
 _ADMIN_SECTIONS = {
     "dashboard", "users", "user360", "titles", "series", "taxonomy",
-    "upload", "pipelines", "jobs", "plans", "payments", "bot-menu",
+    "upload", "pipelines", "jobs", "plans", "coupons", "payments", "bot-menu",
     "audit", "settings", "membership", "ads",
 }
 _ADMIN_HTML = Path(__file__).parent / "templates" / "admin.html"

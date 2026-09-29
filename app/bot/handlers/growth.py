@@ -52,7 +52,7 @@ async def referral_menu(callback: CallbackQuery):
         share_url = "https://t.me/share/url?url=" + quote(link, safe="") + "&text=" + quote("فیلم و سریال را از فمونا سنس دانلود کن! 🎬")
         share_row = [[InlineKeyboardButton(text="📤 اشتراک‌گذاری لینک دعوت", url=share_url)]]
     else:
-        link_line = f"کد دعوت: <code>{code_row.code}</code>\n<i>(BOT_USERNAME در .env تنظیم نشده — لینک پس از تنظیم ساخته می‌شود)</i>"
+        link_line = f"کد دعوت: <code>{code_row.code}</code>\n<i>(شناسه عمومی ربات هنوز در تنظیمات ثبت نشده است؛ لینک دعوت موقتاً در دسترس نیست)</i>"
         share_row = []
 
     await _edit_or_send(

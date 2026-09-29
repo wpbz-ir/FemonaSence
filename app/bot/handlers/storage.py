@@ -48,7 +48,20 @@ def _media_kind(message: Message) -> str:
 @router.channel_post()
 async def storage_channel_post(message: Message):
     configured = settings.production_storage_chat_id
-    if configured is not None and message.chat.id != configured:
+    if configured is None:
+        # [P1 security] بدون کانال ذخیره‌سازیِ پیکربندی‌شده، قبلاً «هر» کانالی که
+        # ربات در آن عضو بود به منبع ورود داده تبدیل می‌شد (سطح تزریق محتوا:
+        # پست‌های کانالِ مهاجم به storage_files و stream_url قابل‌اتصال می‌شدند).
+        # ورود داده مطلقاً رد می‌شود تا مقدار .env تنظیم شود.
+        logger.warning(
+            "STORAGE_INGEST_REFUSED no storage chat configured chat=%s title=%r media=%s — "
+            "set TELEGRAM_STORAGE_CHAT_ID to your storage chat id to enable ingest",
+            message.chat.id,
+            message.chat.title,
+            _media_kind(message),
+        )
+        return
+    if message.chat.id != configured:
         # [DIAG] قبلاً ناسازگاریِ شناسه کانال «بی‌صدا» رد می‌شد و عیب‌یابیِ
         # «چرا فایل من در پنل نیست» غیرممکن بود. حالا هر پستِ نادیده‌گرفته با
         # شناسه‌ی واقعی کانال ثبت می‌شود تا مقدار .env بر همین اساس اصلاح شود.

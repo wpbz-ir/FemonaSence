@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import selectinload
 
 from app.db.models import ContentPipelineRun, MediaJob, MediaJobEvent
@@ -34,10 +34,11 @@ async def get_job(session, job_id):
 
 async def retry_job(session, job_id):
     result = await session.execute(
-        __import__("sqlalchemy").text(
+        text(
             """
             UPDATE media_jobs
             SET status = 'RETRY',
+                attempts = 0,
                 available_at = CURRENT_TIMESTAMP,
                 locked_by = NULL,
                 locked_at = NULL,
@@ -59,7 +60,7 @@ async def retry_job(session, job_id):
 
 async def cancel_job(session, job_id):
     result = await session.execute(
-        __import__("sqlalchemy").text(
+        text(
             """
             UPDATE media_jobs
             SET cancel_requested = TRUE,
@@ -84,7 +85,7 @@ async def cancel_job(session, job_id):
 
 async def set_job_priority(session, job_id, priority: int):
     result = await session.execute(
-        __import__("sqlalchemy").text(
+        text(
             """
             UPDATE media_jobs
             SET priority = :priority, updated_at = CURRENT_TIMESTAMP
@@ -113,7 +114,7 @@ async def list_pipeline_runs(session, *, status: str | None = None, limit: int =
 async def job_stats(session):
     rows = (
         await session.execute(
-            __import__("sqlalchemy").text(
+            text(
                 """
                 SELECT status, COUNT(*) AS count
                 FROM media_jobs
@@ -129,7 +130,7 @@ async def job_stats(session):
 async def pipeline_stats(session):
     rows = (
         await session.execute(
-            __import__("sqlalchemy").text(
+            text(
                 """
                 SELECT status, COUNT(*) AS count
                 FROM content_pipeline_runs

@@ -58,6 +58,13 @@ def _title_name(title: Title) -> str:
     return _safe(title_text(title), 120) or "عنوان بدون نام"
 
 
+def _title_button_name(title: Title) -> str:
+    """نام برای «متن دکمه» — دکمه‌ها HTML-parsed نیستند و نسخه‌ی escape‌شده
+    باعث نمایش لفظی &amp; و امثال آن می‌شود؛ مثل account.py از متنِ تمیزِ
+    بدون escape استفاده می‌کنیم (همان قرارداد growth.py برای نتایج اینلاین)."""
+    return clean_caption(title_text(title), 120).strip() or "عنوان بدون نام"
+
+
 def _is_public_title(title: Title) -> bool:
     return str(getattr(title, "status", "")).upper() in {"PUBLISHED", "ACTIVE", "PUBLIC"}
 
@@ -89,7 +96,7 @@ def _home_row():
 
 def _title_rows(items):
     return [
-        [InlineKeyboardButton(text=f"🎬 {_title_name(item)[:58]}", callback_data=f"cv:title:{item.id}")]
+        [InlineKeyboardButton(text=f"🎬 {_title_button_name(item)[:58]}", callback_data=f"cv:title:{item.id}")]
         for item in items
     ]
 
@@ -453,6 +460,14 @@ async def search_message(message: Message, state: FSMContext):
     )
 
 
+# [P1] catch-all: عکس/استیکر/وویس و هر محتوای غیرمتنی در حالت جستجو —
+# بدون این هندلر هیچ پاسخی داده نمی‌شود و state بی‌صدا گیر می‌کند (الگوی ads.py).
+# state عمداً حفظ می‌شود تا کاربر بتواند متن جستجو را بفرستد.
+@router.message(SearchState.query)
+async def search_unsupported_input(message: Message, state: FSMContext):
+    await message.answer("لطفاً متن ارسال کنید یا /cancel را بزنید.")
+
+
 def _title_caption(title: Title, reactions: dict) -> str:
     description = _safe(getattr(title, "synopsis", ""), 900) or "توضیحات این عنوان هنوز ثبت نشده است."
     meta = []
@@ -614,7 +629,7 @@ async def share_callback(callback: CallbackQuery):
         await callback.message.answer("شناسه عنوان نامعتبر است.")
         return
     if not settings.bot_username:
-        await callback.message.answer("BOT_USERNAME در تنظیمات ربات ثبت نشده است؛ اشتراک‌گذاری لینک آماده نیست.")
+        await callback.message.answer("شناسه عمومی ربات هنوز در تنظیمات ثبت نشده است؛ اشتراک‌گذاری لینک آماده نیست.")
         return
     url = f"https://t.me/{settings.bot_username}?start=title_{title_id}"
     async with session_scope() as session:
@@ -743,6 +758,14 @@ async def comment_message(message: Message, state: FSMContext):
         return
     await state.clear()
     await message.answer("نظر شما ثبت شد. 💬", reply_markup=back_home_keyboard())
+
+
+# [P1] catch-all: عکس/استیکر/وویس و هر محتوای غیرمتنی در حالت ثبت نظر —
+# بدون این هندلر هیچ پاسخی داده نمی‌شود و state بی‌صدا گیر می‌کند (الگوی ads.py).
+# state عمداً حفظ می‌شود تا کاربر بتواند نظر را به‌صورت متن بفرستد.
+@router.message(CommentState.body)
+async def comment_unsupported_input(message: Message, state: FSMContext):
+    await message.answer("لطفاً نظر خود را به‌صورت متن ارسال کنید یا /cancel را بزنید.")
 
 
 @router.callback_query(F.data.regexp(r"^cv:fav:.+$"))

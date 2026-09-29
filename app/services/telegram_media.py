@@ -48,7 +48,7 @@ class TelegramMediaError(RuntimeError):
 class TelegramMediaClient:
     def __init__(self, *, token: str, base_url: str):
         if not token:
-            raise TelegramMediaError("BOT_TOKEN_MISSING", "BOT_TOKEN is not configured")
+            raise TelegramMediaError("BOT_TOKEN_MISSING", "توکن ربات تنظیم نشده است.")
         self.token = token
         self.base_url = base_url.rstrip("/")
         # Bot API محلی = هر base_url‌ای غیر از کلود رسمی (همان تشخیص telegram_storage).
@@ -124,12 +124,12 @@ class TelegramMediaClient:
         if reported_size is not None and reported_size > MAX_DOWNLOAD_BYTES:
             raise TelegramMediaError(
                 "FILE_TOO_LARGE",
-                f"File size {reported_size} exceeds the {MAX_DOWNLOAD_BYTES} byte download cap",
+                "حجم فایل از سقف دانلود (۲.۵ گیگابایت) بیشتر است.",
             )
 
         file_path = str(info.get("file_path") or "")
         if not file_path:
-            raise TelegramMediaError("FILE_PATH_MISSING", "Telegram did not return file_path")
+            raise TelegramMediaError("FILE_PATH_MISSING", "تلگرام مسیر فایل را برنگرداند.")
 
         # [Path Guard] فقط در حالت Bot API محلی و فقط برای مسیرهای مطلقِ داخل
         # دایرکتوری داده‌ی همان سرور، کپی مستقیم انجام می‌شود؛ بقیهٔ حالت‌ها
@@ -139,7 +139,7 @@ class TelegramMediaClient:
             if candidate.stat().st_size > MAX_DOWNLOAD_BYTES:
                 raise TelegramMediaError(
                     "FILE_TOO_LARGE",
-                    f"Local Bot API file exceeds the {MAX_DOWNLOAD_BYTES} byte download cap",
+                    "فایل سرور Bot API محلی از سقف بیشتر است.",
                 )
             destination.parent.mkdir(parents=True, exist_ok=True)
             # کپی فایل حجیم روی thread انجام می‌شود تا event loop بلاک نشود.
@@ -151,7 +151,10 @@ class TelegramMediaClient:
         async with aiohttp.ClientSession(timeout=self.timeout, connector=telegram_aiohttp_connector()) as session:
             async with session.get(url) as response:
                 if response.status >= 400:
-                    raise TelegramMediaError("TELEGRAM_FILE_DOWNLOAD_FAILED", f"HTTP {response.status}")
+                    raise TelegramMediaError(
+                        "TELEGRAM_FILE_DOWNLOAD_FAILED",
+                        f"دانلود فایل از تلگرام ناموفق بود (HTTP {response.status}).",
+                    )
                 received = 0
                 exceeded_cap = False
                 try:
@@ -177,13 +180,13 @@ class TelegramMediaClient:
                     destination.unlink(missing_ok=True)
                     raise TelegramMediaError(
                         "FILE_TOO_LARGE",
-                        f"Download exceeded the {MAX_DOWNLOAD_BYTES} byte cap mid-stream",
+                        "حجم دریافتی از سقف دانلود گذشت.",
                     )
         return info
 
     async def send_video(self, *, chat_id: int | str, path: Path, caption: str, width: int | None = None, height: int | None = None, duration: int | None = None) -> dict:
         if not path.exists():
-            raise TelegramMediaError("OUTPUT_MISSING", "Output media does not exist")
+            raise TelegramMediaError("OUTPUT_MISSING", "فایل خروجی وجود ندارد.")
         # [FIX] Pre-send size guard: the cloud Bot API rejects sendVideo above
         # 50 MB while a local Bot API server (--local) accepts up to 2 GB.
         # Fail fast with a structured error BEFORE streaming minutes of
@@ -191,11 +194,11 @@ class TelegramMediaClient:
         max_send = 2_000_000_000 if self.local_bot_api else 49_000_000
         output_size = path.stat().st_size
         if output_size > max_send:
+            limit_label = "سرور محلی (۲ گیگابایت)" if self.local_bot_api else "ابر (۵۰ مگابایت)"
             raise TelegramMediaError(
                 "OUTPUT_TOO_LARGE",
-                f"Output size {output_size} exceeds the "
-                f"{'local (2 GB)' if self.local_bot_api else 'cloud (50 MB)'} "
-                f"Bot API sendVideo limit of {max_send} bytes",
+                f"حجم خروجی از سقف ارسال Bot API {limit_label} بیشتر است؛ "
+                "برای فایل‌های بزرگ باید سرور Bot API محلی فعال باشد.",
             )
         # HTTP multipart is streamed by aiohttp; the worker does not load the video into RAM.
         with path.open("rb") as video_handle:
@@ -246,7 +249,7 @@ async def register_storage_file(session, *, provider_code: str, message: dict, s
         {"code": provider_code},
     )
     if provider is None:
-        raise TelegramMediaError("STORAGE_PROVIDER_MISSING", f"Storage provider {provider_code} not found")
+        raise TelegramMediaError("STORAGE_PROVIDER_MISSING", f"تأمین‌کننده ذخیره‌سازی {provider_code} یافت نشد.")
 
     video = message.get("video") or {}
     unique_key = video.get("file_unique_id") or video.get("file_id")
@@ -303,7 +306,7 @@ async def register_storage_file(session, *, provider_code: str, message: dict, s
         # fail loudly instead of returning None to mark_succeeded/attach.
         raise TelegramMediaError(
             "STORAGE_REGISTER_LOST",
-            "storage_files row disappeared after conflict-safe registration",
+            "ردیف ذخیره‌سازی پس از ثبت ناپدید شد.",
         )
     return stored_id
 

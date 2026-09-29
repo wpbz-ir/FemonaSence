@@ -24,6 +24,7 @@ from app.services.pricing import plan_toman_price
 from app.services.rate_limit import RateLimitExceeded, RateLimitUnavailable, enforce
 from app.services.user_account import ensure_user
 from app.services.winapay_billing import create_winapay_subscription_order, create_winapay_wallet_order
+from app.utils.telegram_ui import edit_or_send
 
 
 router = Router(name="payments")
@@ -109,7 +110,7 @@ async def show_plans(target: CallbackQuery | Message, state: FSMContext | None =
         title = f"💎 {plan.name_fa}"
         if getattr(plan, "discount_percent", 0):
             title += f" · {int(plan.discount_percent)}٪ تخفیف پلن"
-        rows.append([InlineKeyboardButton(text=title, callback_data="cv:no-op")])
+        rows.append([InlineKeyboardButton(text=title, callback_data="cv:plan-info")])
         buttons = []
         if stars > 0:
             buttons.append(InlineKeyboardButton(text=f"⭐ {_fa_num(stars)} Stars", callback_data=f"cv:buyplan:{plan.id}"))
@@ -128,7 +129,7 @@ async def show_plans(target: CallbackQuery | Message, state: FSMContext | None =
         + (f"\nکد تخفیف «{coupon_echo}» برای گزینه‌های مجاز اعمال می‌شود." if coupon_echo else "")
     )
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=markup)
+        await edit_or_send(target, text, reply_markup=markup)
     else:
         await target.answer(text, reply_markup=markup)
 
@@ -142,6 +143,13 @@ async def subscription_command(message: Message, state: FSMContext):
 @router.callback_query(F.data == "menu:subscription")
 async def subscription_menu(callback: CallbackQuery, state: FSMContext):
     await show_plans(callback, state)
+
+
+# [P2] دکمه‌ی نام پلن فقط اطلاع‌رسانی است؛ callback_data="cv:no-op" قبلی توستِ
+# بی‌ربطِ «نسخه آماده ثبت نشده» (از releases.py) نشان می‌داد — توست فارسی اختصاصی دارد.
+@router.callback_query(F.data == "cv:plan-info")
+async def plan_info_callback(callback: CallbackQuery):
+    await callback.answer("برای خرید، یکی از گزینه‌های پرداخت را انتخاب کنید.")
 
 
 @router.callback_query(F.data == "cv:coupon:enter")
@@ -197,14 +205,29 @@ async def coupon_message(message: Message, state: FSMContext):
     await show_plans(message, state)
 
 
+# [P1] catch-all: عکس/استیکر/وویس و هر محتوای غیرمتنی در حالت وارد کردن کد تخفیف —
+# بدون این هندلر هیچ پاسخی داده نمی‌شود و state بی‌صدا گیر می‌کند (الگوی ads.py).
+# state عمداً حفظ می‌شود تا کاربر بتواند کد را به‌صورت متن بفرستد.
+@router.message(CouponState.code)
+async def coupon_unsupported_input(message: Message, state: FSMContext):
+    await message.answer("لطفاً کد تخفیف را به‌صورت متن ارسال کنید یا /cancel را بزنید.")
+
+
 @router.callback_query(F.data.regexp(r"^cv:buyplan:.+$"))
 async def buy_plan(callback: CallbackQuery, state: FSMContext):
     plan_id = callback.data.split(":", 2)[2]
+    # [P1] UUID پیش از هر کار DBای parse می‌شود؛ خطای انگلیسیِ UUID نباید به کاربر برگردد.
+    # (پاسِ show_alert باید اولین پاسِ callback باشد، پس قبل از callback.answer() است.)
+    try:
+        plan_uuid = UUID(plan_id)
+    except ValueError:
+        await callback.answer("شناسه پلن نامعتبر است.", show_alert=True)
+        return
     await callback.answer()
     coupon_code = await _coupon_code(state)
     try:
         async with session_scope() as session:
-            plan = await session.get(Plan, UUID(plan_id))
+            plan = await session.get(Plan, plan_uuid)
             if plan is None or not plan.active:
                 await callback.message.answer("این پلن در دسترس نیست.")
                 return
@@ -232,6 +255,12 @@ async def buy_plan(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.regexp(r"^cv:buywinapay:.+$"))
 async def buy_winapay(callback: CallbackQuery, state: FSMContext):
     plan_id = callback.data.split(":", 2)[2]
+    # [P1] UUID پیش از هر کار DBای parse می‌شود؛ خطای انگلیسیِ UUID نباید به کاربر برگردد.
+    try:
+        plan_uuid = UUID(plan_id)
+    except ValueError:
+        await callback.answer("شناسه پلن نامعتبر است.", show_alert=True)
+        return
     await callback.answer()
     coupon_code = await _coupon_code(state)
     if not _bank_payment_available():
@@ -239,7 +268,7 @@ async def buy_winapay(callback: CallbackQuery, state: FSMContext):
         return
     try:
         async with session_scope() as session:
-            plan = await session.get(Plan, UUID(plan_id))
+            plan = await session.get(Plan, plan_uuid)
             if plan is None or not plan.active or not plan.price_toman:
                 await callback.message.answer("قیمت بانکی این پلن تنظیم نشده است.")
                 return
@@ -260,7 +289,8 @@ async def buy_winapay(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="💳 ورود به درگاه ویناپی", url=url)],
         [InlineKeyboardButton(text="↩️ اشتراک‌ها", callback_data="menu:subscription")],
     ])
-    await callback.message.edit_text(
+    await edit_or_send(
+        callback,
         # [5-INT-b / 5-G15-e R3] name_fa ادمی-کنترل است و sanitize نمی‌شود؛ در متنِ
         # parse_mode=HTML باید escape شود وگرنه < > & پیامِ پرداخت کاربر را می‌شکند.
         f"<b>💳 پرداخت بانکی</b>\n\n{html.escape(plan.name_fa, quote=False)}\nمبلغ نهایی: <b>{_toman(amount)}</b>\n\nبرای ادامه وارد درگاه شوید.",
@@ -306,7 +336,8 @@ async def wallet_topup(callback: CallbackQuery):
         [InlineKeyboardButton(text="💳 ورود به درگاه", url=url)],
         [InlineKeyboardButton(text="↩️ کیف پول", callback_data="menu:wallet")],
     ])
-    await callback.message.edit_text(
+    await edit_or_send(
+        callback,
         f"<b>💰 شارژ کیف پول</b>\n\nمبلغ: <b>{_toman(amount)}</b>\n\nبرای پرداخت روی دکمه زیر بزنید.",
         reply_markup=markup,
     )
@@ -322,7 +353,25 @@ async def pre_checkout(query: PreCheckoutQuery):
         return
 
     async with session_scope() as session:
-        current_user = await ensure_user(session, query.from_user)
+        # [P1 money] کاربر بن‌شده/غیرفعال نباید بتواند پرداخت Stars را کامل کند؛
+        # بهترین‌تلاش: اگر خودِ lookup کاربر شکست خورد، fail-open به رفتار قبلی
+        # (یک retry پس از rollback؛ شکستِ دوباره همان خطای قبلی را بالا می‌دهد).
+        try:
+            current_user = await ensure_user(session, query.from_user)
+            if getattr(current_user, "status", "ACTIVE") != "ACTIVE":
+                await query.answer(
+                    ok=False,
+                    error_message="حساب شما فعال نیست؛ با پشتیبانی تماس بگیرید.",
+                )
+                return
+        except Exception:
+            logger.warning(
+                "pre_checkout user status gate skipped (user=%s)", query.from_user.id, exc_info=True
+            )
+            # نشست ممکن است بعد از خطا در وضعیت rollback باشد؛ پاک می‌شود تا
+            # بقیه‌ی اعتبارسنجی‌ها (رفتار قبلی) همچنان اجرا شوند.
+            await session.rollback()
+            current_user = await ensure_user(session, query.from_user)
         order = await session.get(Order, order_id)
         if order is None or order.status != "CREATED":
             await query.answer(ok=False, error_message="سفارش معتبر نیست یا قبلاً پردازش شده است.")
@@ -351,7 +400,7 @@ async def successful_payment(message: Message):
         payload = json.loads(payment.invoice_payload)
         order_id = UUID(payload["order_id"])
     except (ValueError, KeyError, json.JSONDecodeError, TypeError):
-        await message.answer("پرداخت دریافت شد اما Payload معتبر نیست. پشتیبانی را در جریان بگذارید.")
+        await message.answer("پرداخت دریافت شد اما محتوای پرداخت معتبر نیست. پشتیبانی را در جریان بگذارید.")
         return
 
     # [FIX-B] The settle txn is wrapped so a settle failure (e.g. coupon/

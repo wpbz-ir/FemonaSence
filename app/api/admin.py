@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from app.api.admin_auth import require_admin_token
 from app.core.config import settings
@@ -606,16 +607,22 @@ async def job_priority(job_id: uuid.UUID, payload: JobPriority, request: Request
 
 @router.post("/storage/register", dependencies=[Depends(admin_gate)])
 async def storage_register(payload: StorageRegister, request: Request):
-    async with session_scope() as session:
-        row = await register_telegram_storage_file(session, **payload.model_dump())
-        await record_admin_action(
-            session,
-            action="REGISTER_STORAGE_FILE",
-            entity_type="storage_file",
-            entity_id=row.id,
-            **_request_meta(request),
-        )
-        return {"id": str(row.id)}
+    # [FIX] رقابت ثبت پنل با ingest کانال ربات روی uq_storage_files_provider_unique:
+    # IntegrityError به‌جای ۵۰۰ با ۴۰۹ فارسی پاسخ داده می‌شود؛ session_scope
+    # هنگام خروج استثنا خودش rollback می‌کند (الگوی رایج همین فایل).
+    try:
+        async with session_scope() as session:
+            row = await register_telegram_storage_file(session, **payload.model_dump())
+            await record_admin_action(
+                session,
+                action="REGISTER_STORAGE_FILE",
+                entity_type="storage_file",
+                entity_id=row.id,
+                **_request_meta(request),
+            )
+            return {"id": str(row.id)}
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="این فایل قبلاً ثبت شده است.") from exc
 
 
 @router.post("/releases/{release_id}/attach-storage", dependencies=[Depends(admin_gate)])
@@ -909,14 +916,25 @@ async def upload_attach(payload: UploadAttach, request: Request):
 @router.get("/payments", dependencies=[Depends(admin_gate)])
 async def payments_list(provider: str | None = None, status: str | None = None, limit: int = 100):
     async with session_scope() as session:
-        stmt = (select(Order, Plan.name_fa, PaymentAttempt, Payment)
+        # [FIX] ضربِ Order×PaymentAttempt×Payment برای سفارش‌های چندتلاش، ردیفِ
+        # یک سفارش را چندبار تکرار می‌کرد و سقف limit را پیش از دیدن بقیه سفارش‌ها
+        # می‌خورد. فقط آخرین تلاشِ هر سفارش (DISTINCT ON) انتخاب می‌شود تا هر سفارش
+        # دقیقاً یک ردیف باشد؛ کلیدهای JSON و ترتیب (جدیدترین سفارش) بدون تغییر.
+        latest_attempt = (
+            select(PaymentAttempt)
+            .distinct(PaymentAttempt.order_id)
+            .order_by(PaymentAttempt.order_id, PaymentAttempt.created_at.desc())
+            .subquery()
+        )
+        attempt_row = aliased(PaymentAttempt, latest_attempt)
+        stmt = (select(Order, Plan.name_fa, attempt_row, Payment)
                 .outerjoin(Plan, Plan.id == Order.plan_id)
-                .outerjoin(PaymentAttempt, PaymentAttempt.order_id == Order.id)
-                .outerjoin(Payment, Payment.payment_attempt_id == PaymentAttempt.id)
+                .outerjoin(attempt_row, attempt_row.order_id == Order.id)
+                .outerjoin(Payment, Payment.payment_attempt_id == attempt_row.id)
                 .order_by(Order.created_at.desc())
                 .limit(min(max(1, limit), 200)))
         if provider:
-            stmt = stmt.where(PaymentAttempt.provider == provider.upper())
+            stmt = stmt.where(attempt_row.provider == provider.upper())
         if status:
             stmt = stmt.where(Order.status == status.upper())
         rows = (await session.execute(stmt)).all()

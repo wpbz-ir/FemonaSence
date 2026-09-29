@@ -19,7 +19,7 @@ async def check_telegram_storage() -> dict:
     chat_id = settings.production_storage_chat_id or os.getenv("TELEGRAM_STORAGE_CHAT_ID")
     client = TelegramMediaClient(token=settings.bot_token, base_url=base_url)
     if not chat_id:
-        return {"ok": False, "error": "TELEGRAM_STORAGE_CHAT_ID is not configured"}
+        return {"ok": False, "error": "شناسه کانال ذخیره‌سازی تنظیم نشده است"}
 
     import aiohttp
 
@@ -54,5 +54,5 @@ async def check_telegram_storage() -> dict:
         "chat_id": str(chat_id),
         "chat_title": chat.get("title"),
         "bot_membership": member,
-        "error": None if membership_ok else "Bot is not an active member of the Telegram storage chat.",
+        "error": None if membership_ok else "ربات عضو فعال کانال ذخیره‌سازی نیست.",
     }

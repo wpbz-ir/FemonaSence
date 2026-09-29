@@ -42,14 +42,18 @@ async def create_payment_session(
 
 async def resolve_payment_session(session, raw_token: str, *, consume: bool = False):
     token_hash = _hash(raw_token)
-    row = await session.scalar(
-        select(PaymentSession)
-        .where(
-            PaymentSession.token_hash == token_hash,
-            PaymentSession.expires_at > datetime.now(timezone.utc),
-            PaymentSession.consumed_at.is_(None),
-        )
+    stmt = select(PaymentSession).where(
+        PaymentSession.token_hash == token_hash,
+        PaymentSession.expires_at > datetime.now(timezone.utc),
+        PaymentSession.consumed_at.is_(None),
     )
+    if consume:
+        # [FIX] Two concurrent verify callbacks with the same raw token could
+        # both pass this SELECT and double-consume; lock the row for the rest
+        # of the transaction so the loser sees consumed_at set (or the row
+        # gone) and bails out.
+        stmt = stmt.with_for_update()
+    row = await session.scalar(stmt)
     if row is None:
         return None
     if consume:

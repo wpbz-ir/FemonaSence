@@ -72,8 +72,25 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    # [FIX] Atomic write (mirrors runtime_payment_config.save_payment_config):
+    # the previous write_text() truncated the file in place, so a crash or a
+    # concurrent reader mid-write could see a half-written/empty JSON state
+    # (weekly-report / backup dedupe would silently reset). Write to a temp
+    # file in the same directory, then os.replace() over the target.
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=STATE_PATH.parent, delete=False
+    ) as tmp:
+        json.dump(state, tmp, ensure_ascii=False, indent=2)
+        tmp.write("\n")
+        temp_name = tmp.name
+    try:
+        os.replace(temp_name, STATE_PATH)
+    finally:
+        try:
+            Path(temp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ---------- دانلودها: ثبت، سهمیه، پربازدید ----------

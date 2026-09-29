@@ -45,6 +45,7 @@ from app.runtime.db import session_scope
 from app.services.audit import record_admin_action
 from app.services.content_pipeline import PipelineError, build_quality_matrix
 from app.services.runtime_admin_config import load_module_settings, save_module_settings
+from app.services.runtime_delivery_config import load_delivery_config, save_delivery_config
 from app.services.runtime_bot_menu_config import load_bot_menu_settings, save_bot_menu_settings
 from app.services.runtime_payment_config import load_payment_config, public_payment_config, save_payment_config
 from app.services.text_normalization import repair_mojibake
@@ -695,6 +696,35 @@ async def payment_gateway_test():
         # جزئیات فقط در لاگ سامانه ثبت می‌شود.
         logger.warning("payment gateway connectivity test failed for base_url=%s", base_url, exc_info=True)
         return {"reachable": False, "status_code": None, "message": "دسترسی شبکه به نشانی درگاه برقرار نیست."}
+
+
+class DeliveryConfigUpdate(BaseModel):
+    # [TTL-DL] اعتبار دکمه‌های دانلود (ثانیه)؛ ۰ = بدون انقضا
+    download_link_ttl_seconds: int = Field(ge=0, le=86400)
+
+
+@router.get("/delivery-config", dependencies=[Depends(admin_gate)])
+async def delivery_config_api():
+    return load_delivery_config()
+
+
+@router.put("/delivery-config", dependencies=[Depends(admin_gate)])
+async def delivery_config_update(payload: DeliveryConfigUpdate, request: Request):
+    try:
+        result = save_delivery_config(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    async with session_scope() as session:
+        await record_admin_action(
+            session,
+            action="UPDATE_DELIVERY_CONFIG",
+            entity_type="delivery_config",
+            entity_id=None,
+            actor_user_id=await _admin_actor_id(session),
+            details={"download_link_ttl_seconds": result["download_link_ttl_seconds"]},
+            **_request_meta(request),
+        )
+    return result
 
 
 @router.get("/settings/modules", dependencies=[Depends(admin_gate)])

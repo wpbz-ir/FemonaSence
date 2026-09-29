@@ -4,9 +4,11 @@ import hashlib
 import re
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.db.models import (
@@ -23,11 +25,26 @@ from app.db.models import (
 )
 from app.db.models.content import Episode
 from app.core.config import settings
+from app.core.media_config import load_media_settings
 from app.services.media_jobs import enqueue_transcode
 from app.services.media_profiles import normalize_quality
 
 
 DEFAULT_QUALITIES = ("480", "720", "1080")
+
+# [PREFLIGHT] سقف دانلود فایلِ منبع بر اساس نوع Bot API:
+#   ابری (api.telegram.org): سقف سختِ getFile = ۲۰ مگابایت — هر jobی با منبعِ بزرگ‌تر
+#   در مرحله دانلود شکست می‌خورد؛ اینجا زودتر و شفاف رد می‌شود.
+#   محلی (telegram-bot-api --local): تا ۲ گیگابایت (سقف ارسال ۲ گیگابایت هم هست).
+_CLOUD_BOT_API_HOSTS = {"api.telegram.org", ""}
+_CLOUD_DOWNLOAD_CAP = 20_000_000
+_LOCAL_DOWNLOAD_CAP = 2_000_000_000
+
+
+def _bot_api_download_cap() -> int:
+    """سقف دانلود منبع (بایت) بر اساس TELEGRAM_BOT_API_BASE_URL فعلی."""
+    host = (urlsplit(load_media_settings().bot_api_base_url).hostname or "").lower()
+    return _CLOUD_DOWNLOAD_CAP if host in _CLOUD_BOT_API_HOSTS else _LOCAL_DOWNLOAD_CAP
 
 
 class PipelineError(ValueError):
@@ -193,6 +210,23 @@ async def build_quality_matrix(
     if storage is None:
         raise PipelineError("فایل ذخیره‌سازی آماده‌ای به این نسخه متصل نیست.")
 
+    # [PREFLIGHT] حجم فایل منبع را پیش از ساخت هر jobای بسنجیم تا به‌جای شکستِ
+    # مبهمِ کارگر رسانه در مرحله دانلود، همین‌جا پیام روشن فارسی به ادمین برسد.
+    try:
+        source_size = int(getattr(storage, "size_bytes", None) or 0)
+    except (TypeError, ValueError):
+        source_size = 0
+    cap = _bot_api_download_cap()
+    if source_size > cap:
+        if cap == _CLOUD_DOWNLOAD_CAP:
+            raise PipelineError(
+                f"حجم فایل منبع ({source_size // 1_000_000} مگابایت) بیشتر از سقف دانلود Bot API ابری تلگرام (۲۰ مگابایت) است و قابل پردازش نیست. "
+                "برای پردازش فایل‌های حجیم باید سرور Bot API محلی را فعال کنید «TELEGRAM_BOT_API_BASE_URL=http://127.0.0.1:8081»؛ راهنمای کامل: docs/LOCAL_BOT_API_SETUP_FA.md"
+            )
+        raise PipelineError(
+            f"حجم فایل منبع ({source_size // 1_000_000} مگابایت) از سقف پردازش (۲ گیگابایت) بیشتر است."
+        )
+
     source_height = _source_height(source, storage, override=source_height)
     if source_height <= 0:
         raise PipelineError(
@@ -332,22 +366,21 @@ async def build_quality_matrix(
                 episode_id=episode_id if parent_type == "EPISODE" else None,
                 **common,
             )
-            session.add(candidate)
-            await session.flush()
-            # Nested re-check inside the same txn: pipeline_key has NO unique
-            # index (no migration allowed here), so a concurrent builder that
-            # committed its DRAFT between our first SELECT and the flush above
-            # would otherwise leave two DRAFT releases for one pipeline_key.
-            # Yield to the rival row and drop our uncommitted candidate.
-            rival = await session.scalar(
-                select(Release).where(
-                    Release.pipeline_key == pipeline_key,
-                    Release.id != candidate.id,
+            # [FIX/RACE] مهاجرت 0006 روی releases.pipeline_key ایندکس یکتای جزئی
+            # (uq_releases_pipeline_key) ساخته است؛ رقیبی که بین SELECT بالا و flush
+            # ما کامیت شود، flush را با IntegrityError می‌کُشد (500 در پنل). داخل
+            # SAVEPOINT ثبت می‌کنیم؛ در تعارض، نقطه ذخیره برمی‌گردد و ردیفِ برنده
+            # رقیب دوباره خوانده می‌شود — دیگر crash و نسخهٔ تکراری وجود ندارد.
+            try:
+                async with session.begin_nested():
+                    session.add(candidate)
+                    await session.flush()
+            except IntegrityError:
+                rival = await session.scalar(
+                    select(Release).where(Release.pipeline_key == pipeline_key)
                 )
-            )
-            if rival is not None:
-                await session.delete(candidate)
-                await session.flush()
+                if rival is None:
+                    raise
                 target = rival
             else:
                 target = candidate
@@ -376,7 +409,7 @@ async def build_quality_matrix(
             )
             if policy is None:
                 # عملاً دست‌نیافتنی: DO NOTHING یعنی برندهٔ هم‌زمان کامیت شده و دیده می‌شود.
-                raise RuntimeError(f"access policy row missing for release {target.id} after upsert")
+                raise RuntimeError(f"ردیف سیاست دسترسی پس از ثبت برای نسخه {target.id} پیدا نشد.")
         else:
             policy.requires_subscription = bool(requires_subscription)
             policy.minimum_plan_rank = max(0, int(minimum_plan_rank))

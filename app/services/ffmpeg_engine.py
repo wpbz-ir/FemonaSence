@@ -31,7 +31,7 @@ async def _run(*args: str, cwd: Path | None = None, timeout: float = 120.0) -> t
             pass
         raise FFmpegError(
             "FFMPEG_TIMEOUT",
-            f"process did not finish within {int(timeout)} seconds",
+            f"فرایند بیش از {int(timeout)} ثانیه طول کشید و متوقف شد.",
         ) from None
     except asyncio.CancelledError:
         # [FIX] Outer cancellation (worker shutdown / task cancel) must not
@@ -56,25 +56,31 @@ async def probe(settings: MediaSettings, input_path: Path) -> dict:
         str(input_path),
     )
     if code != 0:
-        raise FFmpegError("FFPROBE_FAILED", stderr[-4000:] or "ffprobe failed")
+        # Persian-first prefix so the panel toast is readable even when the
+        # ffprobe stderr tail (kept as diagnostic detail) is English.
+        detail = stderr[-4000:].strip()
+        raise FFmpegError(
+            "FFPROBE_FAILED",
+            f"ffprobe شکست خورد. {detail}" if detail else "ffprobe شکست خورد.",
+        )
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise FFmpegError("FFPROBE_INVALID_JSON", "ffprobe returned invalid JSON") from exc
+        raise FFmpegError("FFPROBE_INVALID_JSON", "خروجی ffprobe نامعتبر است.") from exc
 
     streams = data.get("streams") or []
     videos = [s for s in streams if s.get("codec_type") == "video"]
     if not videos:
-        raise FFmpegError("NO_VIDEO_STREAM", "Input contains no video stream")
+        raise FFmpegError("NO_VIDEO_STREAM", "ورودی هیچ استریم ویدیویی ندارد.")
     # [FIX] ffprobe reports "N/A" (or other non-numeric junk) for duration on
     # some containers; float() must not leak a bare ValueError — treat it as
     # the same DURATION_UNKNOWN failure as a missing duration.
     try:
         duration = float((data.get("format") or {}).get("duration") or videos[0].get("duration") or 0)
     except (TypeError, ValueError):
-        raise FFmpegError("DURATION_UNKNOWN", "Input duration could not be determined") from None
+        raise FFmpegError("DURATION_UNKNOWN", "مدت ویدیو قابل تشخیص نبود.") from None
     if duration <= 0:
-        raise FFmpegError("DURATION_UNKNOWN", "Input duration could not be determined")
+        raise FFmpegError("DURATION_UNKNOWN", "مدت ویدیو قابل تشخیص نبود.")
     return {
         "duration": duration,
         "video": {
@@ -90,7 +96,7 @@ async def probe(settings: MediaSettings, input_path: Path) -> dict:
 
 async def transcode(settings: MediaSettings, input_path: Path, output_path: Path, profile: TranscodeProfile, source_height: int) -> dict:
     if source_height <= 0:
-        raise FFmpegError("SOURCE_HEIGHT_UNKNOWN", "Source video height is not known")
+        raise FFmpegError("SOURCE_HEIGHT_UNKNOWN", "ارتفاع ویدیوی منبع مشخص نیست.")
     # [FIX] Even-height cap: when the source is smaller than the profile the
     # minimum could land on an odd value (e.g. 479); scale=-2:479 keeps that
     # odd height and libx264/yuv420p then fails on EVERY odd-height video.
@@ -173,7 +179,7 @@ async def transcode(settings: MediaSettings, input_path: Path, output_path: Path
         temp_path.unlink(missing_ok=True)
         raise FFmpegError(
             "FFMPEG_TIMEOUT",
-            f"ffmpeg did not finish within {int(timeout_seconds)} seconds",
+            f"ffmpeg بیش از {int(timeout_seconds)} ثانیه طول کشید و متوقف شد.",
         ) from None
     except asyncio.CancelledError:
         # [FIX] Outer task cancellation (worker shutdown) previously skipped
@@ -191,7 +197,12 @@ async def transcode(settings: MediaSettings, input_path: Path, output_path: Path
         raise
     if code != 0 or not temp_path.exists() or temp_path.stat().st_size < 1024:
         temp_path.unlink(missing_ok=True)
-        raise FFmpegError("FFMPEG_FAILED", last_error or f"ffmpeg exited with code {code}")
+        # Persian-first message with the exit code; the ffmpeg stderr tail
+        # (last_error) stays as a diagnostic detail after it.
+        message = f"ffmpeg با کد خطای {code} خاتمه یافت."
+        if last_error:
+            message = f"{message} {last_error}"
+        raise FFmpegError("FFMPEG_FAILED", message)
 
     temp_path.replace(output_path)
     return {"size_bytes": output_path.stat().st_size, "output_progress_ms": out_time_ms}

@@ -124,6 +124,10 @@ class Settings:
     startup_validate: bool = os.getenv("STARTUP_VALIDATE", "1").strip().lower() in {"1", "true", "yes", "on"}
     # رشد و عملیات دوره‌ای
     free_daily_download_limit: int = _env_int("FREE_DAILY_DOWNLOAD_LIMIT", 5, lo=0, empty=0)
+    # [TTL-DL] اعتبار زمان‌دار لینک/دکمه‌های دانلود (ثانیه) — مثل کانال‌های بزرگ
+    # فیلم: بعد از نمایش فهرست نسخه‌ها، دکمه‌ها فقط N ثانیه معتبرند. ۰ = بدون انقضا.
+    # مقدار پیش‌فرض؛ ادمین می‌تواند از پنل (تنظیمات سامانه) آن را در زمان اجرا عوض کند.
+    download_link_ttl_seconds: int = _env_int("DOWNLOAD_LINK_TTL_SECONDS", 60, lo=0, hi=86400, empty=60)
     referral_reward_irr: int = _env_int("REFERRAL_REWARD_IRR", 100000, lo=0, empty=0)
     winback_coupon_code: str = os.getenv("WINBACK_COUPON_CODE", "").strip()
     auto_backup_enabled: bool = os.getenv("AUTO_BACKUP_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}

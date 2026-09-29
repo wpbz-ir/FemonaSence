@@ -27,7 +27,7 @@ async def get_or_create_ad_settings(session) -> AdSetting:
         )
         row = await get_ad_settings(session)
         if row is None:  # عملاً دست‌نیافتنی — برندهٔ تراکنش هم‌زمان باید دیده شود
-            raise RuntimeError("ad_settings row missing after upsert")
+            raise RuntimeError("ردیف تنظیمات تبلیغ پس از ثبت یافت نشد.")
     return row
 
 
@@ -141,7 +141,7 @@ async def set_ad_request_status(session, request_id, *, status: str, admin_note:
     """
     new_status = (status or "").strip().upper()
     if new_status not in AD_REQUEST_STATUSES:
-        raise ValueError(f"invalid ad request status: {new_status!r}")
+        raise ValueError(f"وضعیت درخواست تبلیغ نامعتبر است: {new_status!r}")
 
     # [FIX-E] قفل ردیف هنگام خواندن: دو بررسی‌کننده‌ی هم‌زمان (ادمین ربات + پنل)
     # هر دو همین GET را می‌زنند؛ بدون FOR UPDATE هر دو وضعیت فعلی را می‌بینند و
@@ -158,7 +158,7 @@ async def set_ad_request_status(session, request_id, *, status: str, admin_note:
 
     if new_status not in AD_REQUEST_TRANSITIONS.get(current_status, frozenset()):
         raise ValueError(
-            f"invalid ad request status transition: {current_status} -> {new_status}"
+            f"گذار وضعیت درخواست تبلیغ مجاز نیست: {current_status} به {new_status}"
         )
 
     row.status = new_status

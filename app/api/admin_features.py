@@ -52,7 +52,16 @@ async def ads_settings_get():
 @router.put("/ads/settings", dependencies=[Depends(admin_gate)])
 async def ads_settings_put(payload: AdSettingsPayload, request: Request):
     async with session_scope() as session:
-        row = await get_or_create_ad_settings(session)
+        try:
+            # [FIX] رقابت تک‌ردیفی ad_settings.singleton بین چند پروسه: خطای یکتایی
+            # داخل savepoint جمع می‌شود و ردیفِ برنده از تراکنش هم‌زمان دوباره
+            # خوانده می‌شود (الگوی user_account.py / growth.py).
+            async with session.begin_nested():
+                row = await get_or_create_ad_settings(session)
+        except IntegrityError:
+            row = await get_ad_settings(session)
+            if row is None:
+                raise
         row.channel_chat_id = payload.channel_chat_id
         username = (payload.channel_username or "").strip().lstrip("@") or None
         row.channel_username = username

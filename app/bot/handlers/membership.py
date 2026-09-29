@@ -12,8 +12,10 @@ from app.services.membership import (
     gate_enabled,
     invalidate_cache,
     is_admin_user,
+    load_gate_config,
 )
 from app.services.user_account import ensure_user
+from app.utils.telegram_ui import edit_or_send
 
 # این روتر باید «اول از همه» در create_bot ثبت شود تا قبل از بقیه هندلرها
 # دروازه عضویت را اعمال کند. اگر کاربر عضو بود، SkipHandler اجرا شده و
@@ -26,15 +28,16 @@ VERIFY_CALLBACK = "cv:mship:check"
 
 def _gate_keyboard(missing) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for index, channel in enumerate(missing, start=1):
+    for channel in missing:
         label = channel.title or (f"@{channel.username}" if channel.username else str(channel.telegram_chat_id))
         url = channel.invite_url or (
             f"https://t.me/{channel.username}" if channel.username else None
         )
         if url:
             rows.append([InlineKeyboardButton(text=f"🔗 عضویت در {label}"[:64], url=url)])
-        else:
-            rows.append([InlineKeyboardButton(text=f"🔗 {label}"[:64], url=f"https://t.me/c/{abs(channel.telegram_chat_id) - 1000000000000}")])
+        # [P2] بدون username/invite_url هیچ لینکِ درستی قابل ساختن نیست؛
+        # fallback قبلی (t.me/c/…) برای شناسه‌های غیر -100 پیوند خراب می‌ساخت —
+        # به‌جای لینک شکسته، دکمه اصلاً ساخته نمی‌شود (بررسی عضویت همچنان هست).
     rows.append([InlineKeyboardButton(text="✅ بررسی عضویت", callback_data=VERIFY_CALLBACK)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -84,14 +87,14 @@ async def verify_membership(callback: CallbackQuery):
 
         await callback.answer("✅ عضویت شما تأیید شد. خوش آمدید!", show_alert=True)
         if callback.message:
-            try:
-                await callback.message.edit_text(
-                    f"{WELCOME_TEXT}\n\n✅ عضویت شما تأیید شد. منوی اصلی:",
-                    reply_markup=main_menu_keyboard(is_admin=admin),
-                )
-                return
-            except Exception:
-                pass
+            # [P1] ویرایش مستقیم edit_text روی پیامِ عکسی می‌میرد؛ edit_or_send مسیر
+            # edit_caption/fallback را هم پوشش می‌دهد.
+            await edit_or_send(
+                callback,
+                f"{WELCOME_TEXT}\n\n✅ عضویت شما تأیید شد. منوی اصلی:",
+                reply_markup=main_menu_keyboard(is_admin=admin),
+            )
+            return
         await callback.message.answer(
             f"{WELCOME_TEXT}\n\n✅ عضویت شما تأیید شد. منوی اصلی:",
             reply_markup=main_menu_keyboard(is_admin=admin),
@@ -107,6 +110,13 @@ async def membership_gate_message(message: Message, **_kwargs):
         raise SkipHandler
     from_user = message.from_user
     if not from_user:
+        raise SkipHandler
+    # [P1] fast-path بدون هیچ کار DB: وقتی دروازه خاموش است (حالت پیش‌فرض)،
+    # ensure_user + is_admin_user روی «هر» پیام یعنی ۲-۳ رفت‌وبرگشت Neon + کامیت
+    # بیهوده. load_gate_config کش mtime دارد و بدون DB است؛ فقط وقتی روشن است
+    # منطق قبلی (ensure_user/bypass/بررسی عضویت) اجرا می‌شود. /start و دیپ‌لینک‌ها
+    # در روترهای بعدی به‌طور عادی پردازش می‌شوند.
+    if not load_gate_config().get("enabled"):
         raise SkipHandler
     async with session_scope() as session:
         await ensure_user(session, from_user)
@@ -125,6 +135,9 @@ async def membership_gate_callback(callback: CallbackQuery, **_kwargs):
     """دروازه برای همه callbackها به‌جز دکمه بررسی عضویت (که بالاتر هندل شده است)."""
     from_user = callback.from_user
     if not from_user:
+        raise SkipHandler
+    # [P1] fast-path بدون DB — توضیح در membership_gate_message.
+    if not load_gate_config().get("enabled"):
         raise SkipHandler
     async with session_scope() as session:
         await ensure_user(session, from_user)

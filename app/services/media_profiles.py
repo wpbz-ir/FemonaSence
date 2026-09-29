@@ -22,7 +22,7 @@ PROFILES = {
 def normalize_quality(value: str) -> str:
     raw = str(value or "").lower().replace("p", "").strip()
     if raw not in PROFILES:
-        raise ValueError(f"Unsupported target quality: {value}")
+        raise ValueError(f"کیفیت هدف پشتیبانی نمی‌شود: {value}")
     return raw
 
 

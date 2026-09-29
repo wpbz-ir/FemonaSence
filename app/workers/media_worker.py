@@ -14,7 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.database import async_engine_kwargs_from_url
-from app.core.media_config import load_media_settings
+from app.core.media_config import _bin_exists, load_media_settings
 from app.services.content_pipeline import sync_pipeline_run
 from app.services.ffmpeg_engine import FFmpegError, probe, transcode
 from app.services.heartbeats import heartbeat
@@ -102,7 +102,7 @@ async def _finish_cancelled(session, job_id, worker_id: str):
         ),
         {"id": job_id, "worker_id": worker_id},
     )
-    await append_event(session, job_id=job_id, event_type="CANCELLED", message="Cancelled by admin.")
+    await append_event(session, job_id=job_id, event_type="CANCELLED", message="به درخواست مدیر لغو شد.")
 
 
 class MediaWorker:
@@ -277,7 +277,15 @@ class MediaWorker:
     async def process_job(self, job: dict):
         job_id = job["id"]
         if job["job_type"] != "TRANSCODE":
-            raise FFmpegError("UNSUPPORTED_JOB_TYPE", f"Unsupported media job type: {job['job_type']}")
+            raise FFmpegError("UNSUPPORTED_JOB_TYPE", "نوع کار رسانه پشتیبانی نمی‌شود.")
+
+        # [P1] Fast-fail: die BEFORE wasting a 2.5 GB download when the
+        # ffmpeg/ffprobe binaries are missing on this host.
+        if not _bin_exists(self.settings.ffmpeg_bin) or not _bin_exists(self.settings.ffprobe_bin):
+            raise TelegramMediaError(
+                "FFMPEG_MISSING",
+                "ابزار ffmpeg/ffprobe پیدا نشد؛ مسیر FFMPEG_BIN و FFPROBE_BIN را در فایل تنظیمات درست کنید.",
+            )
 
         if job.get("cancel_requested"):
             async with self.sessions() as session:
@@ -310,7 +318,7 @@ class MediaWorker:
                 session,
                 job_id=job_id,
                 event_type="STARTED",
-                message="Media worker started processing.",
+                message="کارگر رسانه پردازش را آغاز کرد.",
             )
             await session.commit()
 
@@ -324,7 +332,7 @@ class MediaWorker:
             if not file_id:
                 raise TelegramMediaError(
                     "SOURCE_STORAGE_UNAVAILABLE",
-                    "Source StorageFile is not ready.",
+                    "فایل ذخیره‌سازی منبع آماده نیست.",
                 )
 
         # [P1 FIX] The lease heartbeat must start BEFORE the download, not
@@ -361,7 +369,7 @@ class MediaWorker:
         if input_path.stat().st_size < 1024:
             raise TelegramMediaError(
                 "SOURCE_FILE_TOO_SMALL",
-                "Source file is unexpectedly small.",
+                "فایل منبع غیرمنتظره کوچک است؛ احتمالاً دانلود ناقص بوده است.",
             )
 
         async with self.sessions() as session:
@@ -379,7 +387,7 @@ class MediaWorker:
                 session,
                 job_id=job_id,
                 event_type="DOWNLOADED",
-                message="Source downloaded.",
+                message="فایل منبع دانلود شد.",
             )
             await session.commit()
 
@@ -426,7 +434,7 @@ class MediaWorker:
                 session,
                 job_id=job_id,
                 event_type="TRANSCODED",
-                message="FFmpeg transcode complete.",
+                message="تبدیل کیفیت با موفقیت انجام شد.",
                 data={
                     "source": media,
                     "output": output_probe,
@@ -445,10 +453,10 @@ class MediaWorker:
             if self.settings.storage_chat_id is None:
                 raise TelegramMediaError(
                     "STORAGE_CHAT_MISSING",
-                    "TELEGRAM_STORAGE_CHAT_ID is not configured.",
+                    "شناسه کانال ذخیره‌سازی تنظیم نشده است (TELEGRAM_STORAGE_CHAT_ID).",
                 )
 
-            caption = f"🎬 فمونا سنس | {profile.code}p\\nJob: {job_id}"
+            caption = f"🎬 فمونا سنس | {profile.code}p\nJob: {job_id}"
             sent = await self.telegram.send_video(
                 chat_id=self.settings.storage_chat_id,
                 path=output_path,
@@ -556,7 +564,7 @@ class MediaWorker:
                 session,
                 job_id=job_id,
                 event_type="PUBLISHED",
-                message="Output stored and attached to target Release.",
+                message="خروجی در ذخیره‌سازی ثبت و به نسخه متصل شد.",
                 data={"storage_file_id": str(storage_id)},
             )
 

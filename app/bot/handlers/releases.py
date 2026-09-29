@@ -16,6 +16,7 @@ from app.services.access import can_access_release
 from app.services.growth import record_download
 from app.services.release_matrix import delivery_target, get_release_variant, list_release_variants, release_badges, release_label
 from app.services.rbac import is_super_admin
+from app.services.runtime_delivery_config import load_delivery_config
 from app.services.user_account import ensure_user
 from app.utils.telegram_ui import edit_or_send as _edit_or_send
 from app.db.models import DownloadHistory, Subscription, Title
@@ -83,10 +84,53 @@ def _honest_badges(row: dict) -> str:
     return " · ".join("آماده پخش در تلگرام" if badge == "پخش" else badge for badge in badges)
 
 
-def _release_button(row: dict) -> InlineKeyboardButton:
+def _release_button(row: dict, expiry: int | None = None) -> InlineKeyboardButton:
     badges = _honest_badges(row)
     suffix = f" · {badges}" if badges else ""
-    return InlineKeyboardButton(text=f"⬇️ {release_label(row)}{suffix}"[:64], callback_data=f"cv:download:{row['id']}")
+    # [TTL-DL] قالب‌های callback_data:
+    #   cv:download:{release_id}            ← میراث (بدون انقضا؛ هنوز پذیرفته می‌شود)
+    #   cv:download:{release_id}:{expiry}   ← لینک زمان‌دار (expiry = unix epoch)
+    # طول کل حداکثر 59 بایت است (سقف تلگرام 64).
+    data = f"cv:download:{row['id']}"
+    if expiry is not None:
+        data = f"{data}:{expiry}"
+    return InlineKeyboardButton(text=f"⬇️ {release_label(row)}{suffix}"[:64], callback_data=data)
+
+
+def _download_ttl() -> tuple[int, int | None]:
+    """(ttl_seconds, expiry_epoch) — ttl=0 یعنی قابلیت انقضا خاموش است."""
+    ttl = load_delivery_config()["download_link_ttl_seconds"]
+    if ttl <= 0:
+        return 0, None
+    return ttl, int(datetime.now(timezone.utc).timestamp()) + ttl
+
+
+async def _expired_download_link(callback: CallbackQuery) -> None:
+    """پاسخ به دکمهٔ منقضی: هشدار فارسی + دکمهٔ تازه‌سازی لینک‌ها (همان صفحهٔ نسخه‌ها)."""
+    await callback.answer("⏳ اعتبار این لینک به پایان رسیده است.", show_alert=True)
+    refresh_cb = "menu:home"
+    parts = (callback.data or ":").split(":")
+    if len(parts) > 2:
+        try:
+            release_id = UUID(parts[2])
+            async with session_scope() as session:
+                row = await get_release_variant(session, release_id=release_id)
+            title_id = (row or {}).get("content_title_id")
+            if title_id:
+                refresh_cb = f"cv:releases:{title_id}"
+        except (ValueError, IndexError):
+            pass
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 تازه‌سازی لینک‌ها", callback_data=refresh_cb),
+            InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home"),
+        ]]
+    )
+    await _edit_or_send(
+        callback,
+        "⏳ اعتبار لینک دانلود به پایان رسیده است؛ برای دریافت فایل، لینک‌ها را تازه‌سازی کنید.",
+        reply_markup=markup,
+    )
 
 
 @router.callback_query(F.data.regexp(r"^cv:releases:.+$"))
@@ -109,17 +153,24 @@ async def release_list(callback: CallbackQuery):
     if str(getattr(title, "status", "")).upper() not in {"PUBLISHED", "ACTIVE", "PUBLIC"}:
         await _edit_or_send(callback, "این عنوان در حال حاضر منتشر نشده است.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_title(title_id)]))
         return
-    buttons = [[_release_button(row)] for row in rows if delivery_target(row)]
+    ttl, expiry = _download_ttl()
+    buttons = [[_release_button(row, expiry)] for row in rows if delivery_target(row)]
     if not buttons:
         buttons = [[InlineKeyboardButton(text="⏳ هنوز نسخه قابل دانلود ثبت نشده است.", callback_data="cv:no-op")]]
     buttons.append(_back_title(title_id))
     # [P1-14] نام عنوان ادمین‌ساخت است و parse_mode پیش‌فرض bot برابر HTML است
     # (session.py)؛ نامی با <>& پیام را می‌شکند یا تزریق می‌شود — همیشه escape شود.
     title_name = html.escape(str(title.title_fa or title.title_en or title.original_title), quote=False)
+    ttl_note = (
+        f"\n\n⏳ اعتبار لینک‌های دانلود فقط {ttl} ثانیه است؛ پس از آن دکمه‌ها منقضی می‌شوند و باید لینک‌ها را تازه‌سازی کنید."
+        if ttl > 0
+        else ""
+    )
     await _edit_or_send(
         callback,
         f"<b>⬇️ نسخه‌های «{title_name}»</b>\n\n"
-        "نسخه موردنظر را انتخاب کنید؛ فایل مستقیماً از تلگرام برای شما ارسال می‌شود:",
+        "نسخه موردنظر را انتخاب کنید؛ فایل مستقیماً از تلگرام برای شما ارسال می‌شود:"
+        + ttl_note,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
@@ -131,11 +182,33 @@ async def no_op(callback: CallbackQuery):
 
 @router.callback_query(F.data.regexp(r"^cv:download:.+$"))
 async def download_release(callback: CallbackQuery):
+    # [TTL-DL] قالب‌های پذیرفته‌شده:
+    #   cv:download:{release_id}            ← میراث (بدون انقضا)
+    #   cv:download:{release_id}:{expiry}   ← لینک زمان‌دار (expiry = unix epoch)
+    parts = (callback.data or "").split(":")
     try:
-        release_id = UUID(callback.data.split(":", 2)[2])
+        release_id = UUID(parts[2])
     except (ValueError, IndexError):
         await callback.answer("شناسه نسخه نامعتبر است.", show_alert=True)
         return
+    expiry: int | None = None
+    if len(parts) > 3:
+        try:
+            expiry = int(parts[3])
+        except ValueError:
+            await callback.answer("لینک دانلود نامعتبر است.", show_alert=True)
+            return
+    ttl, _ = _download_ttl()
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if expiry is not None:
+        if now_ts > expiry:
+            await _expired_download_link(callback)
+            return
+        # [TTL-DL] دفاع در برابر callback دست‌ساز: انقضای فراتر از سقفِ مجازِ فعلی
+        # (با ۱۲۰ ثانیه انعطاف برای تغییر تنظیمات توسط ادمین) پذیرفته نمی‌شود.
+        if ttl > 0 and expiry - now_ts > ttl + 120:
+            await callback.answer("لینک دانلود نامعتبر است؛ لطفاً لینک‌ها را تازه‌سازی کنید.", show_alert=True)
+            return
     await callback.answer()
     async with session_scope() as session:
         row = await get_release_variant(session, release_id=release_id)

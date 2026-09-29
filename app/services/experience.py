@@ -8,7 +8,7 @@ REACTION_DISLIKE = -1
 
 async def toggle_reaction(session, *, user_id, title_id, value: int) -> dict:
     if value not in (REACTION_LIKE, REACTION_DISLIKE):
-        raise ValueError("reaction value is invalid")
+        raise ValueError("واکنش نامعتبر است.")
     selected = await session.scalar(
         text(
             """
@@ -84,7 +84,7 @@ async def list_comments(session, *, title_id, limit: int = 30) -> list[dict]:
 async def add_comment(session, *, user_id, title_id, body: str) -> dict:
     clean = " ".join((body or "").split()).strip()
     if len(clean) < 2 or len(clean) > 1000:
-        raise ValueError("comment length is invalid")
+        raise ValueError("طول نظر نامعتبر است.")
     row = (
         await session.execute(
             text(

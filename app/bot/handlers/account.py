@@ -12,6 +12,7 @@ from app.db.models import Favorite, Subscription, Title, Wallet, WatchHistory
 from app.runtime.db import session_scope
 from app.services.catalog import title_text
 from app.services.user_account import ensure_user
+from app.utils.telegram_ui import edit_or_send
 
 # [P2] نمایش تاریخ انقضا در منطقه‌ی زمانی تهران — همان الگوی releases.py:
 # ایران DST ندارد → Asia/Tehran همیشه UTC+03:30 ثابت است؛ اگر tzdb در دسترس
@@ -48,7 +49,8 @@ async def send_account(callback: CallbackQuery):
     else:
         subscription_text = "فعال نیست"
 
-    await callback.message.edit_text(
+    await edit_or_send(
+        callback,
         "<b>👤 حساب کاربری</b>\n\n"
         f"🆔 شناسه: <code>{callback.from_user.id}</code>\n"
         f"💰 کیف پول: <b>{wallet.balance_irr if wallet else 0}</b>\n"
@@ -69,7 +71,8 @@ async def send_wallet(callback: CallbackQuery):
         [InlineKeyboardButton(text="💳 شارژ 500,000 تومان", callback_data="cv:wallet:500000")],
         [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")],
     ])
-    await callback.message.edit_text(
+    await edit_or_send(
+        callback,
         "<b>💰 کیف پول</b>\n\n"
         f"موجودی فعلی: <b>{wallet.balance_irr if wallet else 0}</b> ریال\n\n"
         "شارژ کیف پول از طریق درگاه بانکی انجام می‌شود.",
@@ -99,7 +102,8 @@ async def send_favorites(callback: CallbackQuery):
             for t in titles
         ] + [[InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")]]
     )
-    await callback.message.edit_text(
+    await edit_or_send(
+        callback,
         "<b>❤️ لیست من</b>\n\n"
         + ("موردی ذخیره نشده است." if not titles else "عنوان موردنظر را انتخاب کنید:"),
         reply_markup=markup,
@@ -128,7 +132,8 @@ async def send_history(callback: CallbackQuery):
             for t in titles
         ] + [[InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:home")]]
     )
-    await callback.message.edit_text(
+    await edit_or_send(
+        callback,
         "<b>🕘 تاریخچه</b>\n\n"
         + ("تاریخچه‌ای ثبت نشده است." if not titles else "عنوان موردنظر را انتخاب کنید:"),
         reply_markup=markup,
